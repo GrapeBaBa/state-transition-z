@@ -1,13 +1,14 @@
 const std = @import("std");
-const Allocator = std.mem.Allocator;
+const ForkSeq = @import("config").ForkSeq;
+const BeaconConfig = @import("config").BeaconConfig;
+const BeaconState = @import("fork_types").BeaconState;
+const EpochCache = @import("../cache/epoch_cache.zig").EpochCache;
 const attester_status = @import("../utils/attester_status.zig");
-const CachedBeaconStateAllForks = @import("../cache/state_cache.zig").CachedBeaconStateAllForks;
 const EpochTransitionCache = @import("../cache/epoch_transition_cache.zig").EpochTransitionCache;
 const preset = @import("preset").preset;
 const c = @import("constants");
 
 const EFFECTIVE_BALANCE_INCREMENT = preset.EFFECTIVE_BALANCE_INCREMENT;
-const ForkSeq = @import("config").ForkSeq;
 const INACTIVITY_PENALTY_QUOTIENT_ALTAIR = preset.INACTIVITY_PENALTY_QUOTIENT_ALTAIR;
 const INACTIVITY_PENALTY_QUOTIENT_BELLATRIX = preset.INACTIVITY_PENALTY_QUOTIENT_BELLATRIX;
 const PARTICIPATION_FLAG_WEIGHTS = c.PARTICIPATION_FLAG_WEIGHTS;
@@ -22,7 +23,7 @@ const FLAG_PREV_SOURCE_ATTESTER_UNSLASHED = attester_status.FLAG_PREV_SOURCE_ATT
 const FLAG_PREV_TARGET_ATTESTER_UNSLASHED = attester_status.FLAG_PREV_TARGET_ATTESTER_UNSLASHED;
 const hasMarkers = attester_status.hasMarkers;
 
-const isInInactivityLeak = @import("../utils/finality.zig").isInInactivityLeak;
+const isInInactivityLeak = @import("inactivity_leak.zig").isInInactivityLeak;
 
 const RewardPenaltyItem = struct {
     base_reward: u64,
@@ -34,9 +35,16 @@ const RewardPenaltyItem = struct {
 };
 
 /// consumer should deinit `rewards` and `penalties` arrays
-pub fn getRewardsAndPenaltiesAltair(allocator: Allocator, cached_state: *const CachedBeaconStateAllForks, cache: *const EpochTransitionCache, rewards: []u64, penalties: []u64) !void {
-    const state = cached_state.state;
-    const validator_count = state.validators().items.len;
+pub fn getRewardsAndPenaltiesAltair(
+    comptime fork: ForkSeq,
+    config: *const BeaconConfig,
+    epoch_cache: *const EpochCache,
+    state: *BeaconState(fork),
+    cache: *const EpochTransitionCache,
+    rewards: []u64,
+    penalties: []u64,
+) !void {
+    const validator_count = try state.validatorsCount();
     const active_increments = cache.total_active_stake_by_increment;
     if (rewards.len != validator_count or penalties.len != validator_count) {
         return error.InvalidArrayLength;
@@ -44,15 +52,12 @@ pub fn getRewardsAndPenaltiesAltair(allocator: Allocator, cached_state: *const C
     @memset(rewards, 0);
     @memset(penalties, 0);
 
-    const is_in_inactivity_leak = isInInactivityLeak(cached_state);
-    // effectiveBalance is multiple of EFFECTIVE_BALANCE_INCREMENT and less than MAX_EFFECTIVE_BALANCE
-    // so there are limited values of them like 32, 31, 30
-    var reward_penalty_item_cache = std.AutoHashMap(u64, RewardPenaltyItem).init(allocator);
-    defer reward_penalty_item_cache.deinit();
-
-    const config = cached_state.config;
-    const epoch_cache = cached_state.getEpochCache();
-    const fork = config.forkSeq(state.slot());
+    const is_in_inactivity_leak = isInInactivityLeak(epoch_cache.epoch, try state.finalizedEpoch());
+    // effectiveBalance is a multiple of EFFECTIVE_BALANCE_INCREMENT and bounded by max effective balance
+    // (32 ETH pre-Electra, 2048 ETH post-Electra). Use a fixed array for O(1) lookup.
+    const max_effective = comptime if (fork.gte(.electra)) preset.MAX_EFFECTIVE_BALANCE_ELECTRA else preset.MAX_EFFECTIVE_BALANCE;
+    const max_increment = comptime max_effective / EFFECTIVE_BALANCE_INCREMENT + 1;
+    var reward_penalty_item_cache: [max_increment]?RewardPenaltyItem = .{null} ** max_increment;
 
     const inactivity_penality_multiplier: u64 =
         if (fork == ForkSeq.altair) INACTIVITY_PENALTY_QUOTIENT_ALTAIR else INACTIVITY_PENALTY_QUOTIENT_BELLATRIX;
@@ -60,7 +65,7 @@ pub fn getRewardsAndPenaltiesAltair(allocator: Allocator, cached_state: *const C
 
     const flags = cache.flags;
     const effective_balance_increments = epoch_cache.getEffectiveBalanceIncrements().items;
-    const inactivity_scores = state.inactivityScores();
+    var inactivity_scores = try state.inactivityScores();
     for (flags, 0..) |flag, i| {
         if (!hasMarkers(flag, FLAG_ELIGIBLE_ATTESTER)) {
             continue;
@@ -68,7 +73,7 @@ pub fn getRewardsAndPenaltiesAltair(allocator: Allocator, cached_state: *const C
 
         const effective_balance_increment = effective_balance_increments[i];
 
-        const reward_penalty_item = if (reward_penalty_item_cache.get(effective_balance_increment)) |rpi| rpi else blk: {
+        const reward_penalty_item = if (reward_penalty_item_cache[effective_balance_increment]) |rpi| rpi else blk: {
             const base_reward = effective_balance_increment * cache.base_reward_per_increment;
             const ts_weigh = PARTICIPATION_FLAG_WEIGHTS[TIMELY_SOURCE_FLAG_INDEX];
             const tt_weigh = PARTICIPATION_FLAG_WEIGHTS[TIMELY_TARGET_FLAG_INDEX];
@@ -87,7 +92,7 @@ pub fn getRewardsAndPenaltiesAltair(allocator: Allocator, cached_state: *const C
                 .timely_source_penalty = @divFloor(base_reward * ts_weigh, WEIGHT_DENOMINATOR),
                 .timely_target_penalty = @divFloor(base_reward * tt_weigh, WEIGHT_DENOMINATOR),
             };
-            try reward_penalty_item_cache.put(effective_balance_increment, rpi);
+            reward_penalty_item_cache[effective_balance_increment] = rpi;
             break :blk rpi;
         };
 
@@ -121,7 +126,7 @@ pub fn getRewardsAndPenaltiesAltair(allocator: Allocator, cached_state: *const C
         // Same logic to getInactivityPenaltyDeltas
         // TODO: if we have limited value in inactivityScores we can provide a cache too
         if (!hasMarkers(flag, FLAG_PREV_TARGET_ATTESTER_UNSLASHED)) {
-            const penalty_numerator: u64 = @as(u64, effective_balance_increment) * EFFECTIVE_BALANCE_INCREMENT * inactivity_scores.items[i];
+            const penalty_numerator: u64 = @as(u64, effective_balance_increment) * EFFECTIVE_BALANCE_INCREMENT * (try inactivity_scores.get(i));
             penalties[i] += @divFloor(penalty_numerator, penalty_denominator);
         }
     }

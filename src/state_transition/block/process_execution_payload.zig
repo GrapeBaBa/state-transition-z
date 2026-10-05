@@ -1,65 +1,51 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const CachedBeaconStateAllForks = @import("../cache/state_cache.zig").CachedBeaconStateAllForks;
-const ssz = @import("consensus_types");
-const preset = @import("preset").preset;
-const ForkSeq = @import("config").ForkSeq;
-const SignedBlock = @import("../types/signed_block.zig").SignedBlock;
-const ExecutionPayloadStatus = @import("../state_transition.zig").ExecutionPayloadStatus;
-const SignedBlindedBeaconBlock = @import("../types/beacon_block.zig").SignedBlindedBeaconBlock;
+const config = @import("config");
+const ForkSeq = config.ForkSeq;
+const ForkTypes = @import("fork_types").ForkTypes;
+const BeaconState = @import("fork_types").BeaconState;
+const BlockType = @import("fork_types").BlockType;
+const BeaconBlockBody = @import("fork_types").BeaconBlockBody;
 const BlockExternalData = @import("../state_transition.zig").BlockExternalData;
-const BeaconConfig = @import("config").BeaconConfig;
+const BeaconConfig = config.BeaconConfig;
 const isMergeTransitionComplete = @import("../utils/execution.zig").isMergeTransitionComplete;
-const computeEpochAtSlot = @import("../utils/epoch.zig").computeEpochAtSlot;
 const getRandaoMix = @import("../utils/seed.zig").getRandaoMix;
 
-const PartialPayload = struct {
-    parent_hash: [32]u8 = undefined,
-    block_hash: [32]u8 = undefined,
-    prev_randao: ssz.primitive.Bytes32.Type = undefined,
-    timestamp: u64 = undefined,
-};
-
 pub fn processExecutionPayload(
+    comptime fork: ForkSeq,
     allocator: Allocator,
-    cached_state: *const CachedBeaconStateAllForks,
-    body: SignedBlock.Body,
+    beacon_config: *const BeaconConfig,
+    state: *BeaconState(fork),
+    current_epoch: u64,
+    comptime block_type: BlockType,
+    body: *const BeaconBlockBody(block_type, fork),
     external_data: BlockExternalData,
 ) !void {
-    const state = cached_state.state;
-    const epoch_cache = cached_state.getEpochCache();
-    const config = epoch_cache.config;
-    var partial_payload = PartialPayload{};
-    switch (body) {
-        .regular => |b| {
-            partial_payload = .{
-                .parent_hash = b.executionPayload().getParentHash(),
-                .block_hash = b.executionPayload().getBlockHash(),
-                .prev_randao = b.executionPayload().getPrevRandao(),
-                .timestamp = b.executionPayload().getTimestamp(),
-            };
+    const parent_hash, const prev_randao, const timestamp = switch (block_type) {
+        .full => .{
+            body.executionPayload().parentHash(),
+            body.executionPayload().prevRandao(),
+            body.executionPayload().timestamp(),
         },
-        .blinded => |b| {
-            partial_payload = .{
-                .parent_hash = b.executionPayloadHeader().getParentHash(),
-                .block_hash = b.executionPayloadHeader().getBlockHash(),
-                .prev_randao = b.executionPayloadHeader().getPrevRandao(),
-                .timestamp = b.executionPayloadHeader().getTimestamp(),
-            };
+        .blinded => .{
+            body.executionPayloadHeader().parentHash(),
+            body.executionPayloadHeader().prevRandao(),
+            body.executionPayloadHeader().timestamp(),
         },
-    }
+    };
 
     // Verify consistency of the parent hash, block number, base fee per gas and gas limit
     // with respect to the previous execution payload header
-    if (isMergeTransitionComplete(state)) {
-        if (!std.mem.eql(u8, &partial_payload.parent_hash, &partial_payload.block_hash)) {
+    if (isMergeTransitionComplete(fork, state)) {
+        const latest_block_hash = try state.latestExecutionPayloadHeaderBlockHash();
+        if (!std.mem.eql(u8, parent_hash, latest_block_hash)) {
             return error.InvalidExecutionPayloadParentHash;
         }
     }
 
     // Verify random
-    const expected_random = getRandaoMix(state, epoch_cache.epoch);
-    if (!std.mem.eql(u8, &partial_payload.prev_randao, &expected_random)) {
+    const expected_random = try getRandaoMix(fork, state, current_epoch);
+    if (!std.mem.eql(u8, prev_randao, expected_random)) {
         return error.InvalidExecutionPayloadRandom;
     }
 
@@ -69,13 +55,13 @@ pub fn processExecutionPayload(
     // def compute_timestamp_at_slot(state: BeaconState, slot: Slot) -> uint64:
     //   slots_since_genesis = slot - GENESIS_SLOT
     //   return uint64(state.genesis_time + slots_since_genesis * SECONDS_PER_SLOT)
-    if (partial_payload.timestamp != state.genesisTime() + state.slot() * config.chain.SECONDS_PER_SLOT) {
+    if (timestamp != (try state.genesisTime()) + (try state.slot()) * beacon_config.chain.SECONDS_PER_SLOT) {
         return error.InvalidExecutionPayloadTimestamp;
     }
 
-    if (state.isPostDeneb()) {
-        const max_blobs_per_block = config.getMaxBlobsPerBlock(computeEpochAtSlot(state.slot()));
-        if (body.blobKzgCommitmentsLen() > max_blobs_per_block) {
+    if (comptime fork.gte(.deneb)) {
+        const max_blobs_per_block = beacon_config.getMaxBlobsPerBlock(current_epoch);
+        if (body.blobKzgCommitments().len > max_blobs_per_block) {
             return error.BlobKzgCommitmentsExceedsLimit;
         }
     }
@@ -87,16 +73,28 @@ pub fn processExecutionPayload(
     // the state transition sync
     //
     // Equivalent to `assert executionEngine.notifyNewPayload(payload)
-    if (external_data.execution_payload_status == .pre_merge) {
-        return error.ExecutionPayloadStatusPreMerge;
-    } else if (external_data.execution_payload_status == .invalid) {
+    if (external_data.execution_payload_status == .invalid) {
         return error.InvalidExecutionPayload;
     }
 
-    const payload_header = switch (body) {
-        .regular => |b| try b.executionPayload().toPayloadHeader(allocator),
-        .blinded => |b| b.executionPayloadHeader(),
-    };
+    var payload_header = ForkTypes(fork).ExecutionPayloadHeader.default_value;
+    switch (block_type) {
+        .full => try body.executionPayload().createExecutionPayloadHeader(allocator, &payload_header),
+        .blinded => {
+            errdefer ForkTypes(fork).ExecutionPayloadHeader.deinit(allocator, &payload_header);
 
-    state.setLatestExecutionPayloadHeader(&payload_header);
+            try ForkTypes(fork).ExecutionPayloadHeader.clone(
+                allocator,
+                &body.executionPayloadHeader().inner,
+                &payload_header,
+            );
+        },
+    }
+    defer ForkTypes(fork).ExecutionPayloadHeader.deinit(allocator, &payload_header);
+
+    try state.setLatestExecutionPayloadHeader(&payload_header);
+}
+
+test {
+    _ = @import("process_execution_payload_test.zig");
 }

@@ -1,7 +1,6 @@
 const std = @import("std");
-const Allocator = std.mem.Allocator;
 const attester_status = @import("../utils/attester_status.zig");
-const CachedBeaconStateAllForks = @import("../cache/state_cache.zig").CachedBeaconStateAllForks;
+const EpochCache = @import("../cache/epoch_cache.zig").EpochCache;
 const EpochTransitionCache = @import("../cache/epoch_transition_cache.zig").EpochTransitionCache;
 const preset = @import("preset").preset;
 const c = @import("constants");
@@ -34,10 +33,7 @@ const RewardPenaltyItem = struct {
     finality_delay_penalty: u64,
 };
 
-pub fn getAttestationDeltas(allocator: Allocator, cached_state: *const CachedBeaconStateAllForks, cache: *const EpochTransitionCache, rewards: []u64, penalties: []u64) !void {
-    const state = cached_state.state;
-    const epoch_cache = cached_state.getEpochCache();
-
+pub fn getAttestationDeltas(epoch_cache: *const EpochCache, cache: *const EpochTransitionCache, finalized_epoch: u64, rewards: []u64, penalties: []u64) !void {
     const flags = cache.flags;
     const proposer_indices = cache.proposer_indices;
     const inclusion_delays = cache.inclusion_delays;
@@ -60,30 +56,27 @@ pub fn getAttestationDeltas(allocator: Allocator, cached_state: *const CachedBea
     const prev_epoch_head_stake_by_increment = cache.prev_epoch_unslashed_stake_head_by_increment;
 
     // sqrt first, before factoring out the increment for later usage
-    const total_balance_in_gwei_f64: f64 = @floatFromInt(total_balance_in_gwei);
-    const total_balance_in_gwei_sqrt: f64 = @sqrt(total_balance_in_gwei_f64);
-    const balance_sq_root: u64 = @intFromFloat(total_balance_in_gwei_sqrt);
-    const finality_delay = cache.prev_epoch - state.finalizedCheckpoint().epoch;
+    const balance_sq_root: u64 = std.math.sqrt(total_balance_in_gwei);
+    const finality_delay = cache.prev_epoch - finalized_epoch;
 
     const BASE_REWARDS_PER_EPOCH = BASE_REWARDS_PER_EPOCH_CONST;
     const proposer_reward_quotient = PROPOSER_REWARD_QUOTIENT;
     const is_in_inactivity_leak = finality_delay > MIN_EPOCHS_TO_INACTIVITY_PENALTY;
 
-    // effectiveBalance is multiple of EFFECTIVE_BALANCE_INCREMENT and less than MAX_EFFECTIVE_BALANCE
-    // so there are limited values of them like 32, 31, 30
-    // TODO(bing): do not deinit and only clear for future use
-    var reward_penalty_item_cache = std.AutoHashMap(u64, RewardPenaltyItem).init(allocator);
-    reward_penalty_item_cache.clearAndFree();
-    defer reward_penalty_item_cache.deinit();
+    // Phase0 only: effectiveBalance is a multiple of EFFECTIVE_BALANCE_INCREMENT and bounded by
+    // MAX_EFFECTIVE_BALANCE (32 ETH), so effective_balance_increment is in range 0..32.
+    // Use a fixed array for O(1) lookup instead of a HashMap.
+    const max_increment = comptime preset.MAX_EFFECTIVE_BALANCE / preset.EFFECTIVE_BALANCE_INCREMENT + 1;
+    var reward_penalty_item_cache: [max_increment]?RewardPenaltyItem = .{null} ** max_increment;
 
     const effective_balance_increments = epoch_cache.getEffectiveBalanceIncrements();
-    std.debug.assert(flags.len == effective_balance_increments.items.len);
+    std.debug.assert(flags.len <= effective_balance_increments.items.len);
     for (0..flags.len) |i| {
         const flag = flags[i];
         const effective_balance_increment = effective_balance_increments.items[i];
         const effective_balance: u64 = @as(u64, effective_balance_increment) * preset.EFFECTIVE_BALANCE_INCREMENT;
 
-        const rewards_items = if (reward_penalty_item_cache.get(effective_balance_increment)) |ri| ri else blk: {
+        const rewards_items = if (reward_penalty_item_cache[effective_balance_increment]) |ri| ri else blk: {
             const base_reward = @divFloor(@divFloor(effective_balance * BASE_REWARD_FACTOR, balance_sq_root), BASE_REWARDS_PER_EPOCH);
             const proposer_reward = @divFloor(base_reward, proposer_reward_quotient);
             const ri = RewardPenaltyItem{
@@ -96,7 +89,7 @@ pub fn getAttestationDeltas(allocator: Allocator, cached_state: *const CachedBea
                 .base_penalty = base_reward * BASE_REWARDS_PER_EPOCH_CONST - proposer_reward,
                 .finality_delay_penalty = @divFloor((effective_balance * finality_delay), INACTIVITY_PENALTY_QUOTIENT),
             };
-            try reward_penalty_item_cache.put(effective_balance_increment, ri);
+            reward_penalty_item_cache[effective_balance_increment] = ri;
             break :blk ri;
         };
 

@@ -1,14 +1,23 @@
 const std = @import("std");
+const Diagnostics = @import("diagnostics").Diagnostics;
 const Allocator = std.mem.Allocator;
-const CachedBeaconStateAllForks = @import("../cache/state_cache.zig").CachedBeaconStateAllForks;
+const metrics = @import("../metrics.zig");
+const time = @import("time");
+const BeaconConfig = @import("config").BeaconConfig;
+const EpochCache = @import("../cache/epoch_cache.zig").EpochCache;
+const ProposerRewards = @import("../cache/state_cache.zig").ProposerRewards;
+const SlashingsCache = @import("../cache/slashings_cache.zig").SlashingsCache;
+const buildSlashingsCacheIfNeeded = @import("../cache/slashings_cache.zig").buildFromStateIfNeeded;
+const BeaconState = @import("fork_types").BeaconState;
+const BlockType = @import("fork_types").BlockType;
+const BeaconBlock = @import("fork_types").BeaconBlock;
 const ForkSeq = @import("config").ForkSeq;
-const ssz = @import("consensus_types");
-const ValidatorIndex = ssz.primitive.ValidatorIndex.Type;
+const types = @import("consensus_types");
+const Root = types.primitive.Root.Type;
+const ValidatorIndex = types.primitive.ValidatorIndex.Type;
 const preset = @import("preset").preset;
-const BeaconBlock = @import("../types/beacon_block.zig").BeaconBlock;
-const SignedBlock = @import("../types/signed_block.zig").SignedBlock;
 const BlockExternalData = @import("../state_transition.zig").BlockExternalData;
-const Withdrawals = ssz.capella.Withdrawals.Type;
+const Withdrawals = types.capella.Withdrawals.Type;
 const WithdrawalsResult = @import("./process_withdrawals.zig").WithdrawalsResult;
 const processBlobKzgCommitments = @import("./process_blob_kzg_commitments.zig").processBlobKzgCommitments;
 const processBlockHeader = @import("./process_block_header.zig").processBlockHeader;
@@ -20,78 +29,146 @@ const processSyncAggregate = @import("./process_sync_committee.zig").processSync
 const processWithdrawals = @import("./process_withdrawals.zig").processWithdrawals;
 const getExpectedWithdrawals = @import("./process_withdrawals.zig").getExpectedWithdrawals;
 const isExecutionEnabled = @import("../utils/execution.zig").isExecutionEnabled;
-// TODO: proposer reward api
-// const ProposerRewardType = @import("../types/proposer_reward.zig").ProposerRewardType;
 
 pub const ProcessBlockOpts = struct {
+    diagnostics: ?*Diagnostics = null,
     verify_signature: bool = true,
 };
 
+/// Process a block and update the state following Ethereum Consensus specifications.
 pub fn processBlock(
+    comptime fork: ForkSeq,
     allocator: Allocator,
-    cached_state: *CachedBeaconStateAllForks,
-    block: *const SignedBlock,
+    io: std.Io,
+    config: *const BeaconConfig,
+    epoch_cache: *EpochCache,
+    state: *BeaconState(fork),
+    proposer_rewards: *ProposerRewards,
+    slashings_cache: *SlashingsCache,
+    comptime block_type: BlockType,
+    block: *const BeaconBlock(block_type, fork),
     external_data: BlockExternalData,
     opts: ProcessBlockOpts,
-    // TODO: metrics
 ) !void {
-    const state = cached_state.state;
-
-    try processBlockHeader(allocator, cached_state, block);
+    // Build slashings cache against the *current* latest_block_header slot (pre-header update).
+    try buildSlashingsCacheIfNeeded(allocator, state, slashings_cache);
+    var timer = time.start(io);
+    try processBlockHeader(fork, allocator, epoch_cache, state, block_type, block);
+    try metrics.state_transition.process_block_step.observe(
+        .{ .step = .processBlockHeader },
+        time.durationSeconds(time.since(io, timer)),
+    );
+    // Keep cache slot in sync with latest_block_header without forcing a rebuild.
+    slashings_cache.updateLatestBlockSlot(block.slot());
+    const body = block.body();
+    const current_epoch = epoch_cache.epoch;
 
     // The call to the process_execution_payload must happen before the call to the process_randao as the former depends
     // on the randao_mix computed with the reveal of the previous block.
-    if (state.isPostBellatrix() and isExecutionEnabled(cached_state.state, block)) {
-        // TODO Deneb: Allow to disable withdrawals for interop testing
-        // https://github.com/ethereum/consensus-specs/blob/b62c9e877990242d63aa17a2a59a49bc649a2f2e/specs/eip4844/beacon-chain.md#disabling-withdrawals
-        if (state.isPostCapella()) {
-            var withdrawals_result = WithdrawalsResult{ .withdrawals = try Withdrawals.initCapacity(
-                allocator,
-                preset.MAX_WITHDRAWALS_PER_PAYLOAD,
-            ) };
-            var withdrawal_balances = std.AutoHashMap(ValidatorIndex, usize).init(allocator);
-            defer withdrawal_balances.deinit();
+    // Gloas (ePBS): execution payload is decoupled from the block, processed via ExecutionPayloadEnvelope
+    if (comptime fork.gte(.bellatrix) and fork.lt(.gloas)) {
+        if (isExecutionEnabled(fork, state, block_type, block)) {
+            // TODO Deneb: Allow to disable withdrawals for interop testing
+            // https://github.com/ethereum/consensus-specs/blob/b62c9e877990242d63aa17a2a59a49bc649a2f2e/specs/eip4844/beacon-chain.md#disabling-withdrawals
+            if (comptime fork.gte(.capella)) {
+                timer = time.start(io);
+                var withdrawals_buf: [preset.MAX_WITHDRAWALS_PER_PAYLOAD]types.capella.Withdrawal.Type = undefined;
+                var withdrawals_result = WithdrawalsResult{ .withdrawals = Withdrawals.initBuffer(&withdrawals_buf) };
+                var withdrawal_balances = std.AutoHashMap(ValidatorIndex, usize).init(allocator);
+                defer withdrawal_balances.deinit();
 
-            try getExpectedWithdrawals(allocator, &withdrawals_result, &withdrawal_balances, cached_state);
-            defer withdrawals_result.withdrawals.clearRetainingCapacity();
+                try getExpectedWithdrawals(
+                    fork,
+                    epoch_cache,
+                    state,
+                    &withdrawals_result,
+                    &withdrawal_balances,
+                );
 
-            const body = block.beaconBlockBody();
-            switch (body) {
-                .regular => |b| {
-                    const actual_withdrawals = b.executionPayload().getWithdrawals();
-                    std.debug.assert(withdrawals_result.withdrawals.items.len == actual_withdrawals.items.len);
-                    for (withdrawals_result.withdrawals.items, actual_withdrawals.items) |expected, actual| {
-                        std.debug.assert(ssz.capella.Withdrawal.equals(&expected, &actual));
-                    }
-                },
-                .blinded => |b| {
-                    const header = b.executionPayloadHeader();
-                    var expected: [32]u8 = undefined;
-                    try ssz.capella.Withdrawals.hashTreeRoot(allocator, &withdrawals_result.withdrawals, &expected);
-                    var actual = header.getWithdrawalsRoot();
-                    std.debug.assert(std.mem.eql(u8, &expected, &actual));
-                },
+                const payload_withdrawals_root = switch (block_type) {
+                    .full => blk: {
+                        const actual_withdrawals = block.body().executionPayload().inner.withdrawals;
+                        if (withdrawals_result.withdrawals.items.len != actual_withdrawals.items.len) {
+                            std.log.err("withdrawal count mismatch: expected {d}, actual {d}", .{
+                                withdrawals_result.withdrawals.items.len,
+                                actual_withdrawals.items.len,
+                            });
+                            return error.WithdrawalsLengthMismatch;
+                        }
+                        var root: Root = undefined;
+                        try types.capella.Withdrawals.hashTreeRoot(allocator, &actual_withdrawals, &root);
+                        break :blk root;
+                    },
+                    .blinded => block.body().executionPayloadHeader().inner.withdrawals_root,
+                };
+                try processWithdrawals(fork, allocator, state, withdrawals_result, payload_withdrawals_root, opts.diagnostics);
+                try metrics.state_transition.process_block_step.observe(
+                    .{ .step = .processWithdrawals },
+                    time.durationSeconds(time.since(io, timer)),
+                );
             }
-            try processWithdrawals(cached_state, withdrawals_result);
-        }
 
-        try processExecutionPayload(
-            allocator,
-            cached_state,
-            block.beaconBlockBody(),
-            external_data,
+            timer = time.start(io);
+            try processExecutionPayload(
+                fork,
+                allocator,
+                config,
+                state,
+                current_epoch,
+                block_type,
+                body,
+                external_data,
+            );
+            try metrics.state_transition.process_block_step.observe(
+                .{ .step = .processExecutionPayload },
+                time.durationSeconds(time.since(io, timer)),
+            );
+        }
+    }
+
+    timer = time.start(io);
+    try processRandao(fork, io, config, epoch_cache, state, block_type, body, block.proposerIndex(), opts.verify_signature);
+    try metrics.state_transition.process_block_step.observe(
+        .{ .step = .processRandao },
+        time.durationSeconds(time.since(io, timer)),
+    );
+    timer = time.start(io);
+    try processEth1Data(fork, state, body.eth1Data());
+    try metrics.state_transition.process_block_step.observe(
+        .{ .step = .processEth1Data },
+        time.durationSeconds(time.since(io, timer)),
+    );
+    timer = time.start(io);
+    try processOperations(fork, allocator, io, config, epoch_cache, state, proposer_rewards, slashings_cache, block_type, body, opts);
+    try metrics.state_transition.process_block_step.observe(
+        .{ .step = .processOperations },
+        time.durationSeconds(time.since(io, timer)),
+    );
+    if (comptime fork.gte(.altair)) {
+        timer = time.start(io);
+        try processSyncAggregate(
+            fork,
+            io,
+            config,
+            epoch_cache,
+            state,
+            proposer_rewards,
+            body.syncAggregate(),
+            opts.verify_signature,
+        );
+        try metrics.state_transition.process_block_step.observe(
+            .{ .step = .processSyncAggregate },
+            time.durationSeconds(time.since(io, timer)),
         );
     }
 
-    try processRandao(cached_state, &block.beaconBlockBody(), block.proposerIndex(), opts.verify_signature);
-    try processEth1Data(allocator, cached_state, block.beaconBlockBody().eth1Data());
-    try processOperations(allocator, cached_state, &block.beaconBlockBody(), opts);
-    if (state.isPostAltair()) {
-        try processSyncAggregate(allocator, cached_state, block, opts.verify_signature);
-    }
-
-    if (state.isPostDeneb()) {
+    if (comptime fork.gte(.deneb)) {
+        timer = time.start(io);
         try processBlobKzgCommitments(external_data);
+        try metrics.state_transition.process_block_step.observe(
+            .{ .step = .processBlobKzgCommitments },
+            time.durationSeconds(time.since(io, timer)),
+        );
         // Only throw PreData so beacon can also sync/process blocks optimistically
         // and let forkChoice handle it
         if (external_data.data_availability_status == .pre_data) {

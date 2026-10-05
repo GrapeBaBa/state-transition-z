@@ -1,60 +1,60 @@
 const std = @import("std");
-const blst = @import("blst");
-const BlstPublicKey = blst.PublicKey;
-const AggregatePublicKey = blst.AggregatePublicKey;
+const bls = @import("bls");
+const AggregatePublicKey = bls.AggregatePublicKey;
 const Allocator = std.mem.Allocator;
-const BeaconStateAllForks = @import("../types/beacon_state.zig").BeaconStateAllForks;
-const EffiectiveBalanceIncrements = @import("../cache/effective_balance_increments.zig").EffectiveBalanceIncrements;
-const ssz = @import("consensus_types");
+const BeaconState = @import("fork_types").BeaconState;
+const EffectiveBalanceIncrements = @import("../cache/effective_balance_increments.zig").EffectiveBalanceIncrements;
+const types = @import("consensus_types");
 const preset = @import("preset").preset;
 const c = @import("constants");
-const SyncCommittee = ssz.altair.SyncCommittee.Type;
-const ValidatorIndex = ssz.primitive.ValidatorIndex.Type;
-const PublicKey = ssz.primitive.BLSPubkey.Type;
+const SyncCommittee = types.altair.SyncCommittee.Type;
+const ValidatorIndex = types.primitive.ValidatorIndex.Type;
 const ForkSeq = @import("config").ForkSeq;
 
 pub const getNextSyncCommitteeIndices = @import("./seed.zig").getNextSyncCommitteeIndices;
-const SyncCommitteeInfo = struct {
-    indices: std.ArrayList(ValidatorIndex),
-    sync_committee: *SyncCommittee,
+
+pub const SyncCommitteeInfo = struct {
+    indices: [preset.SYNC_COMMITTEE_SIZE]ValidatorIndex,
+    sync_committee: SyncCommittee,
 };
 
 /// Consumer must deallocate the returned `SyncCommitteeInfo` struct
-/// TODO: remove if not used
-pub fn getNextSyncCommittee(allocator: Allocator, state: *const BeaconStateAllForks, active_validators_indices: std.ArrayList(ValidatorIndex), effective_balance_increment: EffiectiveBalanceIncrements) !*SyncCommitteeInfo {
-    const indices = std.ArrayList(ValidatorIndex).init(allocator).resize(preset.SYNC_COMMITTEE_SIZE);
-    try getNextSyncCommitteeIndices(allocator, state, active_validators_indices, effective_balance_increment, indices.items);
+pub fn getNextSyncCommittee(
+    comptime fork: ForkSeq,
+    allocator: Allocator,
+    state: *BeaconState(fork),
+    active_validator_indices: []const ValidatorIndex,
+    effective_balance_increments: EffectiveBalanceIncrements,
+    out: *SyncCommitteeInfo,
+) !void {
+    const indices = &out.indices;
+    try getNextSyncCommitteeIndices(fork, allocator, state, active_validator_indices, effective_balance_increments, indices);
+    var validators_view = try state.validators();
 
     // Using the index2pubkey cache is slower because it needs the serialized pubkey.
-    var pubkeys: [preset.SYNC_COMMITTEE_SIZE]PublicKey = undefined;
-    for (indices, 0..) |index, i| {
-        pubkeys[i] = state.validators()[index].pubkey;
+    const pubkeys = &out.sync_committee.pubkeys;
+    var pubkeys_uncompressed: [preset.SYNC_COMMITTEE_SIZE]bls.PublicKey = undefined;
+    for (indices, 0..indices.len) |index, i| {
+        var validator_view = try validators_view.get(index);
+        var validator: types.phase0.Validator.Type = undefined;
+        try validator_view.toValue(allocator, &validator);
+        pubkeys[i] = validator.pubkey;
+        pubkeys_uncompressed[i] = try bls.PublicKey.uncompress(&pubkeys[i]);
     }
 
-    const aggregated_pk = try AggregatePublicKey.aggregateSerialized(pubkeys[0..], false);
-    const sync_committee = try allocator.create(SyncCommittee);
-    errdefer allocator.destroy(sync_committee);
-    sync_committee.* = .{
-        .pubkeys = pubkeys,
-        .aggregate_pubkey = aggregated_pk,
-    };
-    return .{
-        .indices = indices,
-        .sync_committee = sync_committee,
-    };
+    const aggregated_pk = try AggregatePublicKey.aggregate(&pubkeys_uncompressed, false);
+    out.sync_committee.aggregate_pubkey = aggregated_pk.toPublicKey().compress();
 }
 
 pub fn computeSyncParticipantReward(total_active_balance_increments: u64) u64 {
     const total_active_balance = total_active_balance_increments * preset.EFFECTIVE_BALANCE_INCREMENT;
-    const base_reward_per_increment = @divFloor((preset.EFFECTIVE_BALANCE_INCREMENT * preset.BASE_REWARD_FACTOR), total_active_balance);
+    const base_reward_per_increment = @divFloor((preset.EFFECTIVE_BALANCE_INCREMENT * preset.BASE_REWARD_FACTOR), @as(u64, std.math.sqrt(total_active_balance)));
     const total_base_rewards = base_reward_per_increment * total_active_balance_increments;
     const max_participant_rewards = @divFloor(@divFloor(total_base_rewards * c.SYNC_REWARD_WEIGHT, c.WEIGHT_DENOMINATOR), preset.SLOTS_PER_EPOCH);
     return @divFloor(max_participant_rewards, preset.SYNC_COMMITTEE_SIZE);
 }
 
 pub fn computeBaseRewardPerIncrement(total_active_stake_by_increment: u64) u64 {
-    const total_active_stake: f64 = @floatFromInt(total_active_stake_by_increment * preset.EFFECTIVE_BALANCE_INCREMENT);
-    const total_active_stake_sqrt_f64: f64 = @sqrt(total_active_stake);
-    const total_active_stake_sqrt: u64 = @intFromFloat(total_active_stake_sqrt_f64);
+    const total_active_stake_sqrt = @as(u64, std.math.sqrt(total_active_stake_by_increment * preset.EFFECTIVE_BALANCE_INCREMENT));
     return @divFloor((preset.EFFECTIVE_BALANCE_INCREMENT * preset.BASE_REWARD_FACTOR), total_active_stake_sqrt);
 }

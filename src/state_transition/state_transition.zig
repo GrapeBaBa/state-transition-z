@@ -1,184 +1,286 @@
 const std = @import("std");
+const Diagnostics = @import("diagnostics").Diagnostics;
 const Allocator = std.mem.Allocator;
+const ForkSeq = @import("config").ForkSeq;
+const metrics = @import("metrics.zig");
+const observeEpochTransitionStep = metrics.observeEpochTransitionStep;
+const observeEpochTransition = metrics.observeEpochTransition;
+const time = @import("time");
 
-const ssz = @import("consensus_types");
+const types = @import("consensus_types");
 const preset = @import("preset").preset;
-const Root = ssz.primitive.Root.Type;
-const ZERO_HASH = @import("constants").ZERO_HASH;
 
-const ExecutionPayload = @import("types/execution_payload.zig").ExecutionPayload;
-
-const Slot = ssz.primitive.Slot.Type;
-
-const CachedBeaconStateAllForks = @import("cache/state_cache.zig").CachedBeaconStateAllForks;
-pub const SignedBeaconBlock = @import("types/beacon_block.zig").SignedBeaconBlock;
+const Slot = types.primitive.Slot.Type;
+const CachedBeaconState = @import("cache/state_cache.zig").CachedBeaconState;
+const BeaconConfig = @import("config").BeaconConfig;
+const AnyBeaconState = @import("fork_types").AnyBeaconState;
+const AnySignedBeaconBlock = @import("fork_types").AnySignedBeaconBlock;
+const EpochCache = @import("./cache/epoch_cache.zig").EpochCache;
 const verifyProposerSignature = @import("./signature_sets/proposer.zig").verifyProposerSignature;
-const processBlock = @import("./block/process_block.zig").processBlock;
-const BeaconBlock = @import("types/beacon_block.zig").BeaconBlock;
-const SignedVoluntaryExit = ssz.phase0.SignedVoluntaryExit.Type;
-const Attestation = @import("types/attestation.zig").Attestation;
-const Attestations = @import("types/attestation.zig").Attestations;
-const AttesterSlashings = @import("types/attester_slashing.zig").AttesterSlashings;
-const ProposerSlashing = ssz.phase0.ProposerSlashing.Type;
-const BlindedBeaconBlock = @import("types/beacon_block.zig").BlindedBeaconBlock;
-const BlindedBeaconBlockBody = @import("types/beacon_block.zig").BlindedBeaconBlockBody;
-const BeaconBlockBody = @import("types/beacon_block.zig").BeaconBlockBody;
-const SignedBlindedBeaconBlock = @import("types/beacon_block.zig").SignedBlindedBeaconBlock;
-const EpochTransitionCacheOpts = @import("cache/epoch_transition_cache.zig").EpochTransitionCacheOpts;
+pub const processBlock = @import("./block/process_block.zig").processBlock;
 const EpochTransitionCache = @import("cache/epoch_transition_cache.zig").EpochTransitionCache;
-const ReusedEpochTransitionCache = @import("cache/epoch_transition_cache.zig").ReusedEpochTransitionCache;
 const processEpoch = @import("epoch/process_epoch.zig").processEpoch;
 const computeEpochAtSlot = @import("utils/epoch.zig").computeEpochAtSlot;
 const processSlot = @import("slot/process_slot.zig").processSlot;
-
-const SignedBlock = @import("types/signed_block.zig").SignedBlock;
+const ValidatorMonitor = @import("ValidatorMonitor.zig");
+pub const deinitReusedEpochTransitionCache = @import("cache/epoch_transition_cache.zig").deinitReusedEpochTransitionCache;
+const upgradeStateToAltair = @import("slot/upgrade_state_to_altair.zig").upgradeStateToAltair;
+const upgradeStateToBellatrix = @import("slot/upgrade_state_to_bellatrix.zig").upgradeStateToBellatrix;
+const upgradeStateToCapella = @import("slot/upgrade_state_to_capella.zig").upgradeStateToCapella;
+const upgradeStateToDeneb = @import("slot/upgrade_state_to_deneb.zig").upgradeStateToDeneb;
+const upgradeStateToElectra = @import("slot/upgrade_state_to_electra.zig").upgradeStateToElectra;
+const upgradeStateToFulu = @import("slot/upgrade_state_to_fulu.zig").upgradeStateToFulu;
 
 pub const ExecutionPayloadStatus = enum(u8) {
-    pre_merge,
     invalid,
     valid,
 };
 
-pub const BlockExternalData = struct {
-    execution_payload_status: ExecutionPayloadStatus,
-    data_availability_status: enum(u8) {
-        pre_data,
-        out_of_range,
-        available,
-    },
+pub const DataAvailabilityStatus = enum(u8) {
+    pre_data,
+    out_of_range,
+    available,
 };
 
-pub fn processSlotsWithTransientCache(
+pub const BlockExternalData = struct {
+    execution_payload_status: ExecutionPayloadStatus = .valid,
+    data_availability_status: DataAvailabilityStatus = .available,
+};
+
+pub fn processSlots(
     allocator: std.mem.Allocator,
-    post_state: *CachedBeaconStateAllForks,
+    io: std.Io,
+    cached_state: *CachedBeaconState,
     slot: Slot,
-    _: EpochTransitionCacheOpts,
+    validator_monitor: ?*ValidatorMonitor,
 ) !void {
-    var cached_state = post_state.state;
-    if (cached_state.slot() > slot) return error.outdatedSlot;
+    const config = cached_state.config;
+    const epoch_cache = cached_state.epoch_cache;
+    const state = cached_state.state;
 
-    const validator_count = post_state.epoch_cache_ref.get().current_shuffling.get().active_indices.len;
+    if (try state.slot() > slot) return error.outdatedSlot;
 
-    // TODO: do not always allocate
-    var reused_epoch_transition_cache = try ReusedEpochTransitionCache.init(allocator, validator_count);
-    defer reused_epoch_transition_cache.deinit();
-    var epoch_transition_cache: EpochTransitionCache = undefined;
-    defer epoch_transition_cache.deinit();
+    while (try state.slot() < slot) {
+        try processSlot(cached_state.state);
 
-    while (cached_state.slot() < slot) {
-        try processSlot(allocator, post_state);
+        const next_slot = try state.slot() + 1;
+        if (next_slot % preset.SLOTS_PER_EPOCH == 0) {
+            const epoch_transition_timer = time.start(io);
 
-        if ((cached_state.slot() + 1) % preset.SLOTS_PER_EPOCH == 0) {
-            // TODO(bing): metrics
-            // const epochTransitionTimer = metrics?.epochTransitionTime.startTimer();
+            var timer = time.start(io);
+            var epoch_transition_cache = try EpochTransitionCache.init(
+                allocator,
+                config,
+                epoch_cache,
+                state,
+            );
+            defer epoch_transition_cache.deinit();
+            try observeEpochTransitionStep(.{ .step = .before_process_epoch }, @as(u64, @intCast(time.since(io, timer).nanoseconds)));
 
-            // TODO(bing): metrics: time beforeProcessEpoch
-            try EpochTransitionCache.beforeProcessEpoch(allocator, post_state, &reused_epoch_transition_cache, &epoch_transition_cache);
-            try processEpoch(allocator, post_state, &epoch_transition_cache);
-
-            // TODO(bing): registerValidatorStatuses
-
-            cached_state.slotPtr().* += 1;
-
-            try post_state.epoch_cache_ref.get().afterProcessEpoch(post_state, &epoch_transition_cache);
-            // post_state.commit
-        } else {
-            cached_state.slotPtr().* += 1;
-        }
-
-        //epochTransitionTimer
-        const state_epoch = computeEpochAtSlot(cached_state.slot());
-
-        for (post_state.config.forks_descending_epoch_order) |f| {
-            if (state_epoch == f.epoch) {
-                _ = try post_state.state.upgrade(allocator);
-                break; // no need to check all forks once one hits
+            switch (state.forkSeq()) {
+                inline else => |f| {
+                    try processEpoch(
+                        f,
+                        allocator,
+                        io,
+                        config,
+                        epoch_cache,
+                        state.castToFork(f),
+                        &epoch_transition_cache,
+                    );
+                },
             }
+            if (validator_monitor) |monitor| {
+                monitor.registerValidatorStatuses(
+                    epoch_transition_cache.current_epoch,
+                    epoch_transition_cache.flags,
+                    if (epoch_transition_cache.balances) |balances| balances.items else null,
+                );
+            }
+
+            try state.setSlot(next_slot);
+
+            timer = time.start(io);
+            try epoch_cache.afterProcessEpoch(state, &epoch_transition_cache);
+            try observeEpochTransitionStep(.{ .step = .after_process_epoch }, @as(u64, @intCast(time.since(io, timer).nanoseconds)));
+            // state.commit
+
+            const state_epoch = computeEpochAtSlot(next_slot);
+
+            if (state_epoch == config.chain.ALTAIR_FORK_EPOCH) {
+                const phase0_state = try state.tryCastToFork(.phase0);
+                const upgraded = try upgradeStateToAltair(allocator, config, epoch_cache, phase0_state);
+                state.* = .{ .altair = upgraded.inner };
+            }
+            if (state_epoch == config.chain.BELLATRIX_FORK_EPOCH) {
+                const altair_state = try state.tryCastToFork(.altair);
+                const upgraded = try upgradeStateToBellatrix(config, epoch_cache, altair_state);
+                state.* = .{ .bellatrix = upgraded.inner };
+            }
+            if (state_epoch == config.chain.CAPELLA_FORK_EPOCH) {
+                const bellatrix_state = try state.tryCastToFork(.bellatrix);
+                const upgraded = try upgradeStateToCapella(allocator, config, epoch_cache, bellatrix_state);
+                state.* = .{ .capella = upgraded.inner };
+            }
+            if (state_epoch == config.chain.DENEB_FORK_EPOCH) {
+                const capella_state = try state.tryCastToFork(.capella);
+                const upgraded = try upgradeStateToDeneb(allocator, config, epoch_cache, capella_state);
+                state.* = .{ .deneb = upgraded.inner };
+            }
+            if (state_epoch == config.chain.ELECTRA_FORK_EPOCH) {
+                const deneb_state = try state.tryCastToFork(.deneb);
+                const upgraded = try upgradeStateToElectra(allocator, config, epoch_cache, deneb_state);
+                state.* = .{ .electra = upgraded.inner };
+            }
+            if (state_epoch == config.chain.FULU_FORK_EPOCH) {
+                const electra_state = try state.tryCastToFork(.electra);
+                const upgraded = try upgradeStateToFulu(allocator, config, epoch_cache, electra_state);
+                state.* = .{ .fulu = upgraded.inner };
+            }
+
+            try epoch_cache.finalProcessEpoch(state);
+
+            const commit_timer = time.start(io);
+            try state.commit();
+            metrics.state_transition.epoch_transition_commit.observe(time.durationSeconds(time.since(io, commit_timer)));
+            metrics.state_transition.epoch_transition.observe(time.durationSeconds(time.since(io, epoch_transition_timer)));
+        } else {
+            try state.setSlot(next_slot);
         }
     }
+
+    try state.commit();
 }
 
-pub const TransitionOpt = struct {
+pub const TransitionOpts = struct {
+    diagnostics: ?*Diagnostics = null,
     verify_state_root: bool = true,
     verify_proposer: bool = true,
-    verify_signatures: bool = false,
-    do_not_transfer_cache: bool = false,
+    /// NOTE: verifying BLS signatures is expensive - make sure to turn this off for tests.
+    verify_signatures: bool = true,
+    transfer_cache: bool = true,
+    block_external_data: BlockExternalData = .{},
+};
+
+pub const StateTransitionResult = struct {
+    state: AnyBeaconState,
+    epoch_cache: *EpochCache,
+
+    pub fn deinit(self: *StateTransitionResult) void {
+        self.state.deinit();
+        self.epoch_cache.deinit();
+    }
 };
 
 pub fn stateTransition(
     allocator: std.mem.Allocator,
-    state: *CachedBeaconStateAllForks,
-    signed_block: SignedBlock,
-    opts: TransitionOpt,
-) !*CachedBeaconStateAllForks {
-    const block = signed_block.message();
-    const block_slot = switch (block) {
-        .regular => |b| b.slot(),
-        .blinded => |b| b.slot(),
-    };
+    io: std.Io,
+    cached_state: *CachedBeaconState,
+    signed_block: AnySignedBeaconBlock,
+    opts: TransitionOpts,
+    validator_monitor: ?*ValidatorMonitor,
+) !*CachedBeaconState {
+    const block = signed_block.beaconBlock();
+    const block_slot = block.slot();
 
-    const post_state = try state.clone(allocator);
-
+    var post_cached_state = try cached_state.clone(
+        allocator,
+        .{ .transfer_cache = opts.transfer_cache },
+    );
     errdefer {
-        post_state.deinit();
-        allocator.destroy(post_state);
+        post_cached_state.deinit();
+        allocator.destroy(post_cached_state);
     }
 
-    //TODO(bing): metrics
-    //if (metrics) {
-    //  onStateCloneMetrics(postState, metrics, StateCloneSource.stateTransition);
-    //}
+    metrics.state_transition.pre_state_cloned_count.observe(cached_state.cloned_count);
 
-    try processSlotsWithTransientCache(allocator, post_state, block_slot, .{});
+    try processSlots(
+        allocator,
+        io,
+        post_cached_state,
+        block_slot,
+        validator_monitor,
+    );
+
+    const config = post_cached_state.config;
+    const post_epoch_cache = post_cached_state.epoch_cache;
+    const post_state = post_cached_state.state;
 
     // Verify proposer signature only
-    if (opts.verify_proposer and !try verifyProposerSignature(post_state, &signed_block)) {
+    if (opts.verify_proposer and !try verifyProposerSignature(
+        allocator,
+        io,
+        config,
+        post_epoch_cache,
+        signed_block,
+    )) {
         return error.InvalidBlockSignature;
     }
 
-    //  // Note: time only on success
-    //  const processBlockTimer = metrics?.processBlockTime.startTimer();
-    //
-    try processBlock(
-        allocator,
-        post_state,
-        &signed_block,
-        BlockExternalData{
-            .execution_payload_status = .valid,
-            .data_availability_status = .available,
+    if (block.forkSeq() != post_state.forkSeq()) {
+        return error.InvalidBlockForkForState;
+    }
+    // Note: time only on success
+    var timer = time.start(io);
+    switch (post_state.forkSeq()) {
+        inline else => |f| {
+            switch (block.blockType()) {
+                inline else => |bt| {
+                    if (comptime (bt == .blinded and f.lt(.bellatrix)) or (bt == .blinded and f.gte(.gloas))) {
+                        return error.InvalidBlockTypeForFork;
+                    } else {
+                        var block_diagnostics: Diagnostics = .{};
+                        const diagnostics = opts.diagnostics orelse &block_diagnostics;
+                        processBlock(
+                            f,
+                            allocator,
+                            io,
+                            config,
+                            post_epoch_cache,
+                            post_state.castToFork(f),
+                            &post_cached_state.proposer_rewards,
+                            &post_cached_state.slashings_cache,
+                            bt,
+                            block.castToFork(bt, f),
+                            opts.block_external_data,
+                            .{ .verify_signature = opts.verify_signatures, .diagnostics = diagnostics },
+                        ) catch |err| {
+                            if (diagnostics.detail) |*detail| {
+                                std.log.warn("Block processing failed at slot {d}: {f}", .{ block_slot, detail });
+                            }
+                            return err;
+                        };
+                    }
+                },
+            }
         },
-        .{ .verify_signature = opts.verify_signatures },
-    );
-    //
-    // TODO(bing): commit
-    //  const processBlockCommitTimer = metrics?.processBlockCommitTime.startTimer();
-    //  postState.commit();
-    //  processBlockCommitTimer?.();
+    }
+    metrics.state_transition.process_block.observe(time.durationSeconds(time.since(io, timer)));
 
-    //  // Note: time only on success. Include processBlock and commit
-    //  processBlockTimer?.();
-    // TODO(bing): metrics
-    //  if (metrics) {
-    //    onPostStateMetrics(postState, metrics);
-    //  }
+    const proposer_rewards = post_cached_state.proposer_rewards;
+    try metrics.state_transition.proposer_rewards.set(.{ .type = .attestation }, proposer_rewards.attestations);
+    try metrics.state_transition.proposer_rewards.set(.{ .type = .sync_aggregate }, proposer_rewards.sync_aggregate);
+    try metrics.state_transition.proposer_rewards.set(.{ .type = .slashing }, proposer_rewards.slashing);
+
+    timer = time.start(io);
+    try post_state.commit();
+    metrics.state_transition.process_block_commit.observe(time.durationSeconds(time.since(io, timer)));
 
     // Verify state root
     if (opts.verify_state_root) {
-        var out: [32]u8 = undefined;
-        //    const hashTreeRootTimer = metrics?.stateHashTreeRootTime.startTimer({
-        //      source: StateHashTreeRootSource.stateTransition,
-        //    });
-        try post_state.state.hashTreeRoot(allocator, &out);
-        //    hashTreeRootTimer?.();
+        timer = time.start(io);
+        const post_state_root = try post_state.hashTreeRoot();
+        try metrics.state_transition.state_hash_tree_root.observe(.{ .source = .state_transition }, time.durationSeconds(time.since(io, timer)));
 
-        const block_state_root = switch (block) {
-            .regular => |b| b.stateRoot(),
-            .blinded => |b| b.stateRoot(),
-        };
-        if (!std.mem.eql(u8, &out, &block_state_root)) {
+        const block_state_root = block.stateRoot();
+        if (!std.mem.eql(u8, post_state_root, block_state_root)) {
             return error.InvalidStateRoot;
         }
     }
 
-    return post_state;
+    return post_cached_state;
+}
+
+test {
+    _ = @import("state_transition_test.zig");
 }

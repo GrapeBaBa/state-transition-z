@@ -1,17 +1,39 @@
-const ssz = @import("consensus_types");
-const CachedBeaconStateAllForks = @import("../cache/state_cache.zig").CachedBeaconStateAllForks;
+const ForkSeq = @import("config").ForkSeq;
+const BeaconState = @import("fork_types").BeaconState;
 const EpochTransitionCache = @import("../cache/epoch_transition_cache.zig").EpochTransitionCache;
 const preset = @import("preset").preset;
 const EPOCHS_PER_ETH1_VOTING_PERIOD = preset.EPOCHS_PER_ETH1_VOTING_PERIOD;
 
 /// Reset eth1DataVotes tree every `EPOCHS_PER_ETH1_VOTING_PERIOD`.
-pub fn processEth1DataReset(cached_state: *CachedBeaconStateAllForks, cache: *const EpochTransitionCache) void {
+pub fn processEth1DataReset(
+    comptime fork: ForkSeq,
+    state: *BeaconState(fork),
+    cache: *const EpochTransitionCache,
+) !void {
     const next_epoch = cache.current_epoch + 1;
 
     // reset eth1 data votes
     if (next_epoch % EPOCHS_PER_ETH1_VOTING_PERIOD == 0) {
-        const state = cached_state.state;
-        const state_eth1_data_votes = state.eth1DataVotes();
-        @memcpy(state_eth1_data_votes.items, ssz.phase0.Eth1DataVotes.default_value.items);
+        try state.resetEth1DataVotes();
     }
+}
+
+const std = @import("std");
+const TestCachedBeaconState = @import("../test_utils/root.zig").TestCachedBeaconState;
+const Node = @import("persistent_merkle_tree").Node;
+
+test "processEth1DataReset - sanity" {
+    const allocator = std.testing.allocator;
+    const pool_size = 200_000;
+    var pool = try Node.Pool.init(.{ .page_allocator = allocator, .allocator = allocator, .pool_size = pool_size });
+    defer pool.deinit();
+
+    var test_state = try TestCachedBeaconState.init(allocator, &pool, 10_000);
+    defer test_state.deinit();
+
+    try processEth1DataReset(
+        .electra,
+        test_state.cached_state.state.castToFork(.electra),
+        test_state.epoch_transition_cache,
+    );
 }

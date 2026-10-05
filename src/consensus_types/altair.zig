@@ -9,14 +9,17 @@ pub const Fork = phase0.Fork;
 pub const ForkData = phase0.ForkData;
 pub const Checkpoint = phase0.Checkpoint;
 pub const Validator = phase0.Validator;
+pub const Validators = phase0.Validators;
 pub const AttestationData = phase0.AttestationData;
 pub const IndexedAttestation = phase0.IndexedAttestation;
 pub const PendingAttestation = phase0.PendingAttestation;
 pub const Eth1Data = phase0.Eth1Data;
+pub const Eth1DataVotes = phase0.Eth1DataVotes;
 pub const HistoricalBatch = phase0.HistoricalBatch;
 pub const DepositMessage = phase0.DepositMessage;
 pub const DepositData = phase0.DepositData;
 pub const BeaconBlockHeader = phase0.BeaconBlockHeader;
+pub const SignedBeaconBlockHeader = phase0.SignedBeaconBlockHeader;
 pub const SigningData = phase0.SigningData;
 pub const ProposerSlashing = phase0.ProposerSlashing;
 pub const AttesterSlashing = phase0.AttesterSlashing;
@@ -31,6 +34,9 @@ pub const HistoricalBlockRoots = phase0.HistoricalBlockRoots;
 pub const HistoricalStateRoots = phase0.HistoricalStateRoots;
 pub const ProposerSlashings = phase0.ProposerSlashings;
 pub const AttesterSlashings = phase0.AttesterSlashings;
+pub const Slashings = phase0.Slashings;
+pub const Balances = phase0.Balances;
+pub const RandaoMixes = phase0.RandaoMixes;
 pub const Attestations = phase0.Attestations;
 pub const Deposits = phase0.Deposits;
 pub const VoluntaryExits = phase0.VoluntaryExits;
@@ -41,7 +47,7 @@ pub const SyncAggregate = ssz.FixedContainerType(struct {
 });
 
 pub const SyncCommittee = ssz.FixedContainerType(struct {
-    pubkeys: ssz.FixedVectorType(p.BLSPubkey, preset.SYNC_COMMITTEE_SIZE),
+    pubkeys: ssz.FixedVectorType(p.BLSPubkey, preset.SYNC_COMMITTEE_SIZE, .{}),
     aggregate_pubkey: p.BLSPubkey,
 });
 
@@ -65,10 +71,8 @@ pub const BeaconBlock = ssz.VariableContainerType(struct {
     body: BeaconBlockBody,
 });
 
-pub const SignedBeaconBlockHeader = ssz.FixedContainerType(struct {
-    message: BeaconBlockHeader,
-    signature: p.BLSSignature,
-});
+pub const InactivityScores = ssz.FixedListType(p.Uint64, preset.VALIDATOR_REGISTRY_LIMIT, .{ .chunked_leaf = true });
+pub const EpochParticipation = ssz.FixedListType(p.Uint8, preset.VALIDATOR_REGISTRY_LIMIT, .{ .chunked_leaf = true });
 
 pub const BeaconState = ssz.VariableContainerType(struct {
     genesis_time: p.Uint64,
@@ -78,21 +82,21 @@ pub const BeaconState = ssz.VariableContainerType(struct {
     latest_block_header: BeaconBlockHeader,
     block_roots: HistoricalBlockRoots,
     state_roots: HistoricalStateRoots,
-    historical_roots: ssz.FixedListType(p.Root, preset.HISTORICAL_ROOTS_LIMIT),
+    historical_roots: phase0.HistoricalRoots,
     eth1_data: Eth1Data,
     eth1_data_votes: phase0.Eth1DataVotes,
     eth1_deposit_index: p.Uint64,
-    validators: ssz.FixedListType(Validator, preset.VALIDATOR_REGISTRY_LIMIT),
-    balances: ssz.FixedListType(p.Gwei, preset.VALIDATOR_REGISTRY_LIMIT),
-    randao_mixes: ssz.FixedVectorType(p.Bytes32, preset.EPOCHS_PER_HISTORICAL_VECTOR),
-    slashings: ssz.FixedVectorType(p.Gwei, preset.EPOCHS_PER_SLASHINGS_VECTOR),
-    previous_epoch_participation: ssz.FixedListType(p.Uint8, preset.VALIDATOR_REGISTRY_LIMIT),
-    current_epoch_participation: ssz.FixedListType(p.Uint8, preset.VALIDATOR_REGISTRY_LIMIT),
-    justification_bits: ssz.BitVectorType(c.JUSTIFICATION_BITS_LENGTH),
+    validators: phase0.Validators,
+    balances: phase0.Balances,
+    randao_mixes: phase0.RandaoMixes,
+    slashings: phase0.Slashings,
+    previous_epoch_participation: EpochParticipation,
+    current_epoch_participation: EpochParticipation,
+    justification_bits: phase0.JustificationBits,
     previous_justified_checkpoint: Checkpoint,
     current_justified_checkpoint: Checkpoint,
     finalized_checkpoint: Checkpoint,
-    inactivity_scores: ssz.FixedListType(p.Uint64, preset.VALIDATOR_REGISTRY_LIMIT),
+    inactivity_scores: InactivityScores,
     current_sync_committee: SyncCommittee,
     next_sync_committee: SyncCommittee,
 });
@@ -101,8 +105,6 @@ pub const SignedBeaconBlock = ssz.VariableContainerType(struct {
     message: BeaconBlock,
     signature: p.BLSSignature,
 });
-
-pub const EpochParticipation = ssz.FixedListType(p.ParticipationFlags, preset.VALIDATOR_REGISTRY_LIMIT);
 
 pub const SyncCommitteeMessage = ssz.FixedContainerType(struct {
     slot: p.Slot,
@@ -142,15 +144,15 @@ pub const LightClientHeader = ssz.FixedContainerType(struct {
 pub const LightClientBootstrap = ssz.FixedContainerType(struct {
     header: LightClientHeader,
     current_sync_committee: SyncCommittee,
-    current_sync_committee_branch: ssz.FixedVectorType(p.Bytes32, std.math.log2(c.CURRENT_SYNC_COMMITTEE_GINDEX)),
+    current_sync_committee_branch: ssz.FixedVectorType(p.Bytes32, std.math.log2(c.CURRENT_SYNC_COMMITTEE_GINDEX), .{}),
 });
 
 pub const LightClientUpdate = ssz.FixedContainerType(struct {
     attested_header: LightClientHeader,
     next_sync_committee: SyncCommittee,
-    next_sync_committee_branch: ssz.FixedVectorType(p.Bytes32, std.math.log2(c.NEXT_SYNC_COMMITTEE_GINDEX)),
+    next_sync_committee_branch: ssz.FixedVectorType(p.Bytes32, std.math.log2(c.NEXT_SYNC_COMMITTEE_GINDEX), .{}),
     finalized_header: LightClientHeader,
-    finality_branch: ssz.FixedVectorType(p.Bytes32, std.math.log2(c.FINALIZED_ROOT_GINDEX)),
+    finality_branch: ssz.FixedVectorType(p.Bytes32, std.math.log2(c.FINALIZED_ROOT_GINDEX), .{}),
     sync_aggregate: SyncAggregate,
     signature_slot: p.Slot,
 });
@@ -158,7 +160,7 @@ pub const LightClientUpdate = ssz.FixedContainerType(struct {
 pub const LightClientFinalityUpdate = ssz.FixedContainerType(struct {
     attested_header: LightClientHeader,
     finalized_header: LightClientHeader,
-    finality_branch: ssz.FixedVectorType(p.Bytes32, std.math.log2(c.FINALIZED_ROOT_GINDEX)),
+    finality_branch: ssz.FixedVectorType(p.Bytes32, std.math.log2(c.FINALIZED_ROOT_GINDEX), .{}),
     sync_aggregate: SyncAggregate,
     signature_slot: p.Slot,
 });

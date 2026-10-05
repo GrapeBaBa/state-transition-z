@@ -1,20 +1,21 @@
 const std = @import("std");
+const diagnostics = @import("diagnostics");
 const Allocator = std.mem.Allocator;
-const CachedBeaconStateAllForks = @import("../cache/state_cache.zig").CachedBeaconStateAllForks;
-const ssz = @import("consensus_types");
+const EpochCache = @import("../cache/epoch_cache.zig").EpochCache;
+const BeaconState = @import("fork_types").BeaconState;
+const types = @import("consensus_types");
+const Root = types.primitive.Root.Type;
 const preset = @import("preset").preset;
 const c = @import("constants");
 const ForkSeq = @import("config").ForkSeq;
-const Withdrawal = ssz.capella.Withdrawal.Type;
-const Withdrawals = ssz.capella.Withdrawals.Type;
-const ValidatorIndex = ssz.primitive.ValidatorIndex.Type;
-const ExecutionAddress = ssz.primitive.ExecutionAddress.Type;
-const PendingPartialWithdrawal = ssz.electra.PendingPartialWithdrawal.Type;
-const ExecutionPayload = @import("../types/execution_payload.zig").ExecutionPayload;
+const Withdrawals = types.capella.Withdrawals.Type;
+const ValidatorIndex = types.primitive.ValidatorIndex.Type;
+const ExecutionAddress = types.primitive.ExecutionAddress.Type;
 const hasExecutionWithdrawalCredential = @import("../utils/electra.zig").hasExecutionWithdrawalCredential;
 const hasEth1WithdrawalCredential = @import("../utils/capella.zig").hasEth1WithdrawalCredential;
 const getMaxEffectiveBalance = @import("../utils/validator.zig").getMaxEffectiveBalance;
 const decreaseBalance = @import("../utils/balance.zig").decreaseBalance;
+const Node = @import("persistent_merkle_tree").Node;
 
 pub const WithdrawalsResult = struct {
     withdrawals: Withdrawals,
@@ -22,88 +23,114 @@ pub const WithdrawalsResult = struct {
     processed_partial_withdrawals_count: usize = 0,
 };
 
+/// right now for the implementation we pass in processBlock()
+/// for the spec, we pass in params from operations.zig
+/// TODO: spec and implementation should be the same
+/// refer to https://github.com/ethereum/consensus-specs/blob/dev/specs/electra/beacon-chain.md#modified-process_withdrawals
 pub fn processWithdrawals(
-    cached_state: *const CachedBeaconStateAllForks,
+    comptime fork: ForkSeq,
+    allocator: Allocator,
+    state: *BeaconState(fork),
     expected_withdrawals_result: WithdrawalsResult,
+    payload_withdrawals_root: Root,
+    diag: ?*diagnostics.Diagnostics,
 ) !void {
-    const state = cached_state.state;
     // processedPartialWithdrawalsCount is withdrawals coming from EL since electra (EIP-7002)
     const processed_partial_withdrawals_count = expected_withdrawals_result.processed_partial_withdrawals_count;
     const expected_withdrawals = expected_withdrawals_result.withdrawals.items;
     const num_withdrawals = expected_withdrawals.len;
 
+    var expected_withdrawals_root: [32]u8 = undefined;
+    try types.capella.Withdrawals.hashTreeRoot(allocator, &expected_withdrawals_result.withdrawals, &expected_withdrawals_root);
+
+    if (!std.mem.eql(u8, &expected_withdrawals_root, &payload_withdrawals_root)) {
+        return diagnostics.state_transition.withdrawalsRootMismatch(
+            diag,
+            &expected_withdrawals_root,
+            &payload_withdrawals_root,
+        );
+    }
+
     for (0..num_withdrawals) |i| {
         const withdrawal = expected_withdrawals[i];
-        decreaseBalance(state, withdrawal.validator_index, withdrawal.amount);
+        try decreaseBalance(fork, state, withdrawal.validator_index, withdrawal.amount);
     }
 
-    if (state.isPostElectra()) {
-        const pending_partial_withdrawals = state.pendingPartialWithdrawals();
-        const keep_len = pending_partial_withdrawals.items.len - processed_partial_withdrawals_count;
+    if (comptime fork.gte(.electra)) {
+        if (processed_partial_withdrawals_count > 0) {
+            var pending_partial_withdrawals = try state.pendingPartialWithdrawals();
+            const truncated = try pending_partial_withdrawals.sliceFrom(processed_partial_withdrawals_count);
 
-        std.mem.copyForwards(PendingPartialWithdrawal, pending_partial_withdrawals.items[0..keep_len], pending_partial_withdrawals.items[processed_partial_withdrawals_count..]);
-        pending_partial_withdrawals.shrinkRetainingCapacity(keep_len);
+            try state.setPendingPartialWithdrawals(truncated);
+        }
     }
 
-    const next_withdrawal_index = state.nextWithdrawalIndex();
     // Update the nextWithdrawalIndex
     if (expected_withdrawals.len > 0) {
         const latest_withdrawal = expected_withdrawals[expected_withdrawals.len - 1];
-        next_withdrawal_index.* = latest_withdrawal.index + 1;
+        try state.setNextWithdrawalIndex(latest_withdrawal.index + 1);
     }
 
-    // Update the nextWithdrawalValidatorIndex
+    // Update the next_withdrawal_validator_index
+    const validators_len: u64 = @intCast(try state.validatorsCount());
+    const next_withdrawal_validator_index = try state.nextWithdrawalValidatorIndex();
     if (expected_withdrawals.len == preset.MAX_WITHDRAWALS_PER_PAYLOAD) {
-        // All slots filled, nextWithdrawalValidatorIndex should be validatorIndex having next turn
-        next_withdrawal_index.* =
-            (expected_withdrawals[expected_withdrawals.len - 1].validator_index + 1) % state.validators().items.len;
+        // All slots filled, next_withdrawal_validator_index should be validatorIndex having next turn
+        try state.setNextWithdrawalValidatorIndex(
+            (expected_withdrawals[expected_withdrawals.len - 1].validator_index + 1) % validators_len,
+        );
     } else {
-        // expected withdrawals came up short in the bound, so we move nextWithdrawalValidatorIndex to
+        // expected withdrawals came up short in the bound, so we move next_withdrawal_validator_index to
         // the next post the bound
-        next_withdrawal_index.* = (state.nextWithdrawalValidatorIndex().* + preset.MAX_VALIDATORS_PER_WITHDRAWALS_SWEEP) % state.validators().items.len;
+        try state.setNextWithdrawalValidatorIndex(
+            (next_withdrawal_validator_index + preset.MAX_VALIDATORS_PER_WITHDRAWALS_SWEEP) % validators_len,
+        );
     }
 }
 
-// Consumer should deinit WithdrawalsResult with .deinit() after use
+/// Called by the block proposer to find a list of withdrawals to include in the block.
+///
+/// This list is assumed to be bounded by `preset.MAX_WITHDRAWALS_PER_PAYLOAD`.
+///
+/// Caller should deinit `withdrawal_balances` with .deinit() after use.
 pub fn getExpectedWithdrawals(
-    allocator: Allocator,
+    comptime fork: ForkSeq,
+    epoch_cache: *const EpochCache,
+    state: *BeaconState(fork),
     withdrawals_result: *WithdrawalsResult,
     withdrawal_balances: *std.AutoHashMap(ValidatorIndex, usize),
-    cached_state: *const CachedBeaconStateAllForks,
 ) !void {
-    const state = cached_state.state;
-    if (state.isPreCapella()) {
-        return error.InvalidForkSequence;
-    }
-
-    const epoch_cache = cached_state.getEpochCache();
+    std.debug.assert(withdrawals_result.withdrawals.capacity == preset.MAX_WITHDRAWALS_PER_PAYLOAD);
+    if (comptime fork.lt(.capella)) return error.InvalidForkSequence;
 
     const epoch = epoch_cache.epoch;
-    var withdrawal_index = state.nextWithdrawalIndex().*;
-    const validators = state.validators();
-    const balances = state.balances();
-    const next_withdrawal_validator_index = state.nextWithdrawalValidatorIndex();
+    var withdrawal_index = try state.nextWithdrawalIndex();
+    var validators = try state.validators();
+    var balances = try state.balances();
+    const next_withdrawal_validator_index = try state.nextWithdrawalValidatorIndex();
 
     // partial_withdrawals_count is withdrawals coming from EL since electra (EIP-7002)
     var processed_partial_withdrawals_count: u64 = 0;
 
-    if (state.isPostElectra()) {
-        // TODO: this optimization logic is not needed for TreeView
-        // MAX_PENDING_PARTIALS_PER_WITHDRAWALS_SWEEP = 8, PENDING_PARTIAL_WITHDRAWALS_LIMIT: 134217728 so we should only call getAllReadonly() if it makes sense
-        // pendingPartialWithdrawals comes from EIP-7002 smart contract where it takes fee so it's more likely than not validator is in correct condition to withdraw
+    if (comptime fork.gte(.electra)) {
+        // MAX_PENDING_PARTIALS_PER_WITHDRAWALS_SWEEP = 8, PENDING_PARTIAL_WITHDRAWALS_LIMIT: 134217728 so we should just lazily iterate thru state.pending_partial_withdrawals.
+        // pending_partial_withdrawals comes from EIP-7002 smart contract where it takes fee so it's more likely than not validator is in correct condition to withdraw
         // also we may break early if withdrawableEpoch > epoch
-        const pending_partial_withdrawals = state.pendingPartialWithdrawals();
-        for (0..pending_partial_withdrawals.items.len) |i| {
-            const withdrawal = pending_partial_withdrawals.items[i];
+        var pending_partial_withdrawals = try state.pendingPartialWithdrawals();
+        var pending_partial_withdrawals_it = pending_partial_withdrawals.iteratorReadonly(0);
+        const pending_partial_withdrawals_len = try pending_partial_withdrawals.length();
+
+        for (0..pending_partial_withdrawals_len) |_| {
+            const withdrawal = try pending_partial_withdrawals_it.nextValue();
             if (withdrawal.withdrawable_epoch > epoch or withdrawals_result.withdrawals.items.len == preset.MAX_PENDING_PARTIALS_PER_WITHDRAWALS_SWEEP) {
                 break;
             }
 
-            const validator = validators.items[withdrawal.validator_index];
-            const total_withdrawn_gop = try withdrawal_balances.getOrPut(withdrawal.validator_index);
+            var validator: types.phase0.Validator.Type = undefined;
+            try validators.getValue(undefined, withdrawal.validator_index, &validator);
 
-            const total_withdrawn: u64 = if (total_withdrawn_gop.found_existing) total_withdrawn_gop.value_ptr.* else 0;
-            const balance = balances.items[withdrawal.validator_index] - total_withdrawn;
+            const total_withdrawn: u64 = @intCast(withdrawal_balances.get(withdrawal.validator_index) orelse 0);
+            const balance = try balances.get(withdrawal.validator_index) - total_withdrawn;
 
             if (validator.exit_epoch == c.FAR_FUTURE_EPOCH and
                 validator.effective_balance >= preset.MIN_ACTIVATION_BALANCE and
@@ -112,8 +139,8 @@ pub fn getExpectedWithdrawals(
                 const balance_over_min_activation_balance = balance - preset.MIN_ACTIVATION_BALANCE;
                 const withdrawable_balance = if (balance_over_min_activation_balance < withdrawal.amount) balance_over_min_activation_balance else withdrawal.amount;
                 var execution_address: ExecutionAddress = undefined;
-                std.mem.copyForwards(u8, &execution_address, validator.withdrawal_credentials[12..]);
-                try withdrawals_result.withdrawals.append(allocator, .{
+                @memcpy(&execution_address, validator.withdrawal_credentials[12..]);
+                withdrawals_result.withdrawals.appendAssumeCapacity(.{
                     .index = withdrawal_index,
                     .validator_index = withdrawal.validator_index,
                     .address = execution_address,
@@ -126,26 +153,28 @@ pub fn getExpectedWithdrawals(
         }
     }
 
-    const bound = @min(validators.items.len, preset.MAX_VALIDATORS_PER_WITHDRAWALS_SWEEP);
+    const validators_count = try validators.length();
+    const bound = @min(validators_count, preset.MAX_VALIDATORS_PER_WITHDRAWALS_SWEEP);
     // Just run a bounded loop max iterating over all withdrawals
     // however breaks out once we have MAX_WITHDRAWALS_PER_PAYLOAD
     var n: usize = 0;
-    while (n < bound) : (n += 1) {
+    while (n < bound) {
         // Get next validator in turn
-        const validator_index = (next_withdrawal_validator_index.* + n) % validators.items.len;
-        const validator = validators.items[validator_index];
-        const withdraw_balance_gop = try withdrawal_balances.getOrPut(validator_index);
-        const withdraw_balance: u64 = if (withdraw_balance_gop.found_existing) withdraw_balance_gop.value_ptr.* else 0;
-        const balance = if (state.isPostElectra())
+        const validator_index = (next_withdrawal_validator_index + n) % validators_count;
+        n += 1;
+        var validator = try validators.getReadonly(validator_index);
+        const withdraw_balance: u64 = @intCast(withdrawal_balances.get(validator_index) orelse 0);
+        const val_balance = try balances.get(validator_index);
+        const balance = if (comptime fork.gte(.electra))
             // Deduct partially withdrawn balance already queued above
-            if (balances.items[validator_index] > withdraw_balance) balances.items[validator_index] - withdraw_balance else 0
+            if (val_balance > withdraw_balance) val_balance - withdraw_balance else 0
         else
-            balances.items[validator_index];
+            val_balance;
 
-        const withdrawable_epoch = validator.withdrawable_epoch;
-        const withdrawal_credentials = validator.withdrawal_credentials;
-        const effective_balance = validator.effective_balance;
-        const has_withdrawable_credentials = if (state.isPostElectra()) hasExecutionWithdrawalCredential(withdrawal_credentials) else hasEth1WithdrawalCredential(withdrawal_credentials);
+        const withdrawable_epoch = try validator.get("withdrawable_epoch");
+        const withdrawal_credentials = try validator.getFieldRoot("withdrawal_credentials");
+        const effective_balance = try validator.get("effective_balance");
+        const has_withdrawable_credentials = if (comptime fork.gte(.electra)) hasExecutionWithdrawalCredential(withdrawal_credentials) else hasEth1WithdrawalCredential(withdrawal_credentials);
         // early skip for balance = 0 as its now more likely that validator has exited/slashed with
         // balance zero than not have withdrawal credentials set
         if (balance == 0 or !has_withdrawable_credentials) {
@@ -155,14 +184,15 @@ pub fn getExpectedWithdrawals(
         // capella full withdrawal
         if (withdrawable_epoch <= epoch) {
             var execution_address: ExecutionAddress = undefined;
-            std.mem.copyForwards(u8, &execution_address, validator.withdrawal_credentials[12..]);
-            try withdrawals_result.withdrawals.append(allocator, .{
+            @memcpy(&execution_address, withdrawal_credentials[12..]);
+            withdrawals_result.withdrawals.appendAssumeCapacity(.{
                 .index = withdrawal_index,
                 .validator_index = validator_index,
                 .address = execution_address,
                 .amount = balance,
             });
-        } else if ((effective_balance == if (state.isPostElectra())
+            withdrawal_index += 1;
+        } else if ((effective_balance == if (comptime fork.gte(.electra))
             getMaxEffectiveBalance(withdrawal_credentials)
         else
             preset.MAX_EFFECTIVE_BALANCE) and balance > effective_balance)
@@ -170,8 +200,8 @@ pub fn getExpectedWithdrawals(
             // capella partial withdrawal
             const partial_amount = balance - effective_balance;
             var execution_address: ExecutionAddress = undefined;
-            std.mem.copyForwards(u8, &execution_address, validator.withdrawal_credentials[12..]);
-            try withdrawals_result.withdrawals.append(allocator, .{
+            @memcpy(&execution_address, withdrawal_credentials[12..]);
+            withdrawals_result.withdrawals.appendAssumeCapacity(.{
                 .index = withdrawal_index,
                 .validator_index = validator_index,
                 .address = execution_address,
@@ -189,4 +219,60 @@ pub fn getExpectedWithdrawals(
 
     withdrawals_result.sampled_validators = n;
     withdrawals_result.processed_partial_withdrawals_count = processed_partial_withdrawals_count;
+}
+const TestCachedBeaconState = @import("../test_utils/root.zig").TestCachedBeaconState;
+
+test "getExpectedWithdrawals counts swept validators without rebuilding validators tree" {
+    const allocator = std.testing.allocator;
+    const validator_count = 256;
+    const pool_size = 180_000;
+    var pool = try Node.Pool.init(.{ .page_allocator = allocator, .allocator = allocator, .pool_size = pool_size });
+    defer pool.deinit();
+
+    for ([_]usize{ 0, preset.MAX_WITHDRAWALS_PER_PAYLOAD - 1, preset.MAX_WITHDRAWALS_PER_PAYLOAD }) |withdrawal_count| {
+        var test_state = try TestCachedBeaconState.init(allocator, &pool, validator_count);
+        defer test_state.deinit();
+        const state = test_state.cached_state.state.castToFork(.electra);
+        var validators = try state.validators();
+        const withdrawal_credentials = [_]u8{1} ++ [_]u8{0} ** 31;
+        for (1..withdrawal_count + 1) |i| {
+            var validator = try validators.get(i);
+            try validator.setValue("withdrawal_credentials", &withdrawal_credentials);
+            try validator.set("withdrawable_epoch", 0);
+        }
+
+        try state.commit();
+        const validators_root_before = validators.getRoot();
+
+        var withdrawals_buf: [preset.MAX_WITHDRAWALS_PER_PAYLOAD]types.capella.Withdrawal.Type = undefined;
+        var withdrawals_result = WithdrawalsResult{
+            .withdrawals = Withdrawals.initBuffer(&withdrawals_buf),
+        };
+        var withdrawal_balances = std.AutoHashMap(ValidatorIndex, usize).init(allocator);
+        defer withdrawal_balances.deinit();
+
+        try getExpectedWithdrawals(
+            .electra,
+            test_state.cached_state.epoch_cache,
+            state,
+            &withdrawals_result,
+            &withdrawal_balances,
+        );
+        try state.commit();
+        try std.testing.expectEqual(validators_root_before, validators.getRoot());
+
+        const expected_sampled = if (withdrawal_count == preset.MAX_WITHDRAWALS_PER_PAYLOAD)
+            withdrawal_count + 1
+        else
+            @min(validator_count, preset.MAX_VALIDATORS_PER_WITHDRAWALS_SWEEP);
+        try std.testing.expectEqual(expected_sampled, withdrawals_result.sampled_validators);
+        try std.testing.expectEqual(withdrawal_count, withdrawals_result.withdrawals.items.len);
+        for (withdrawals_result.withdrawals.items, 1..) |withdrawal, validator_index| {
+            try std.testing.expectEqual(validator_index, withdrawal.validator_index);
+        }
+
+        var root: Root = undefined;
+        try types.capella.Withdrawals.hashTreeRoot(allocator, &withdrawals_result.withdrawals, &root);
+        try processWithdrawals(.electra, allocator, state, withdrawals_result, root, null);
+    }
 }

@@ -1,12 +1,17 @@
 const std = @import("std");
-const ssz = @import("consensus_types");
+const types = @import("consensus_types");
+const metrics = @import("../metrics.zig");
+const time = @import("time");
 
 const Allocator = std.mem.Allocator;
-const ValidatorIndex = ssz.primitive.ValidatorIndex.Type;
+const ValidatorIndex = types.primitive.ValidatorIndex.Type;
 const ForkSeq = @import("config").ForkSeq;
-const Epoch = ssz.primitive.Epoch.Type;
+const Epoch = types.primitive.Epoch.Type;
 const preset = @import("preset").preset;
-const CachedBeaconStateAllForks = @import("./state_cache.zig").CachedBeaconStateAllForks;
+const BeaconConfig = @import("config").BeaconConfig;
+const EpochCache = @import("../cache/epoch_cache.zig").EpochCache;
+const AnyBeaconState = @import("fork_types").AnyBeaconState;
+const BeaconState = @import("fork_types").BeaconState;
 
 const attester_status = @import("../utils/attester_status.zig");
 const FLAG_CURR_HEAD_ATTESTER = attester_status.FLAG_CURR_HEAD_ATTESTER;
@@ -26,12 +31,50 @@ const MIN_ACTIVATION_BALANCE = preset.MIN_ACTIVATION_BALANCE;
 const hasCompoundingWithdrawalCredential = @import("../utils/electra.zig").hasCompoundingWithdrawalCredential;
 const computeBaseRewardPerIncrement = @import("../utils/sync_committee.zig").computeBaseRewardPerIncrement;
 const processPendingAttestations = @import("../epoch/process_pending_attestations.zig").processPendingAttestations;
+const Node = @import("persistent_merkle_tree").Node;
+const EpochShufflingRc = @import("../utils/epoch_shuffling.zig").EpochShufflingRc;
+const EpochShuffling = @import("../utils/epoch_shuffling.zig").EpochShuffling;
 
 const BoolArray = std.ArrayList(bool);
 const UsizeArray = std.ArrayList(usize);
 const U8Array = std.ArrayList(u8);
 const U64Array = std.ArrayList(u64);
-const U32Array = std.ArrayList(u32);
+
+/// A tail buffer data structure which provides a view on a borrowed base slice
+/// and a fixed growable tail for validators added during epoch processing.
+///
+/// Provides validator-indexed compounding flags.
+///
+/// NOTE: This data structure is useful for views on large arrays with a small,
+/// upper-limit on array growth. The tail avoids reallocating the process-global
+/// reused cache.
+const CompoundingValidatorFlags = struct {
+    /// An immutable view on the base array.
+    base: []const bool,
+    /// Growth is bounded by `preset.MAX_PENDING_DEPOSITS_PER_EPOCH` = 16.
+    tail: [preset.MAX_PENDING_DEPOSITS_PER_EPOCH]bool = undefined,
+    tail_len: usize = 0,
+
+    /// Appends the flag for a validator added during epoch processing.
+    ///
+    /// Asserts that the fixed tail has remaining capacity.
+    fn append(self: *CompoundingValidatorFlags, value: bool) void {
+        std.debug.assert(self.tail_len < self.tail.len);
+        self.tail[self.tail_len] = value;
+        self.tail_len += 1;
+    }
+
+    /// Returns a validator's flag from the borrowed base or fixed tail.
+    ///
+    /// The index must be within the combined logical length.
+    fn get(self: *const CompoundingValidatorFlags, validator_index: usize) bool {
+        if (validator_index < self.base.len) return self.base[validator_index];
+
+        const tail_index = validator_index - self.base.len;
+        std.debug.assert(tail_index < self.tail_len);
+        return self.tail[tail_index];
+    }
+};
 
 const ValidatorActivation = struct {
     validator_index: ValidatorIndex,
@@ -40,8 +83,48 @@ const ValidatorActivation = struct {
 
 const ValidatorActivationList = std.ArrayList(ValidatorActivation);
 
+const ShufflingJob = struct {
+    const Error = Allocator.Error || @import("swap_or_not_shuffle").ShufflingError;
+
+    io: std.Io,
+    future: std.Io.Future(Error!Result),
+
+    const Result = struct {
+        shuffling: *EpochShuffling,
+        duration: std.Io.Duration,
+    };
+
+    fn worker(allocator: Allocator, io: std.Io, seed: [32]u8, epoch: Epoch, active_indices: []ValidatorIndex) Error!Result {
+        errdefer allocator.free(active_indices);
+
+        const timer = time.start(io);
+        const shuffling = try EpochShuffling.init(allocator, seed, epoch, active_indices);
+        return .{ .shuffling = shuffling, .duration = time.since(io, timer) };
+    }
+
+    fn start(allocator: Allocator, io: std.Io, seed: [32]u8, epoch: Epoch, active_indices: []ValidatorIndex) @This() {
+        return .{
+            .io = io,
+            .future = std.Io.async(io, worker, .{ allocator, io, seed, epoch, active_indices }),
+        };
+    }
+
+    fn join(self: *@This()) !*EpochShuffling {
+        const result = try self.future.await(self.io);
+        metrics.state_transition.epoch_shuffling_job.observe(time.durationSeconds(result.duration));
+        return result.shuffling;
+    }
+
+    fn cancel(self: *@This()) void {
+        const result = self.future.cancel(self.io) catch return;
+        metrics.state_transition.epoch_shuffling_job.observe(time.durationSeconds(result.duration));
+        result.shuffling.deinit();
+    }
+};
+
 /// this is a cache that's never gc'd, it is used to store data that is reused across multiple epochs
-pub const ReusedEpochTransitionCache = struct {
+const ReusedEpochTransitionCache = struct {
+    allocator: Allocator,
     is_active_prev_epoch: BoolArray,
     is_active_current_epoch: BoolArray,
     is_active_next_epoch: BoolArray,
@@ -51,7 +134,6 @@ pub const ReusedEpochTransitionCache = struct {
 
     flags: U8Array,
 
-    // TODO: nextShufflingDecisionRoot, is it necessary without ShufflingCache?
     next_epoch_shuffling_active_validator_indices: std.ArrayList(ValidatorIndex),
 
     is_compounding_validator_arr: BoolArray,
@@ -60,49 +142,96 @@ pub const ReusedEpochTransitionCache = struct {
     current_epoch_participation: U8Array,
     rewards: U64Array,
     penalties: U64Array,
+    slashing_penalties: U64Array,
 
-    pub fn init(allocator: Allocator, validator_count: usize) !ReusedEpochTransitionCache {
-        // TODO: should we allocate more than validator_count?
-        return .{
-            .is_active_prev_epoch = try BoolArray.initCapacity(allocator, validator_count),
-            .is_active_current_epoch = try BoolArray.initCapacity(allocator, validator_count),
-            .is_active_next_epoch = try BoolArray.initCapacity(allocator, validator_count),
-            .proposer_indices = try UsizeArray.initCapacity(allocator, validator_count),
-            .inclusion_delays = try UsizeArray.initCapacity(allocator, validator_count),
-            .flags = try U8Array.initCapacity(allocator, validator_count),
-            .next_epoch_shuffling_active_validator_indices = try std.ArrayList(ValidatorIndex).initCapacity(allocator, validator_count),
-            .is_compounding_validator_arr = try BoolArray.initCapacity(allocator, validator_count),
-            .previous_epoch_participation = try U8Array.initCapacity(allocator, validator_count),
-            .current_epoch_participation = try U8Array.initCapacity(allocator, validator_count),
-            .rewards = try U64Array.initCapacity(allocator, validator_count),
-            .penalties = try U64Array.initCapacity(allocator, validator_count),
-        };
+    pub fn init(self: *ReusedEpochTransitionCache, allocator: Allocator, validator_count: usize) !void {
+        self.allocator = allocator;
+        self.is_active_prev_epoch = try BoolArray.initCapacity(allocator, validator_count);
+        errdefer self.is_active_prev_epoch.deinit(allocator);
+        self.is_active_current_epoch = try BoolArray.initCapacity(allocator, validator_count);
+        errdefer self.is_active_current_epoch.deinit(allocator);
+        self.is_active_next_epoch = try BoolArray.initCapacity(allocator, validator_count);
+        errdefer self.is_active_next_epoch.deinit(allocator);
+        self.proposer_indices = .empty;
+        self.inclusion_delays = .empty;
+        self.flags = try U8Array.initCapacity(allocator, validator_count);
+        errdefer self.flags.deinit(allocator);
+        self.next_epoch_shuffling_active_validator_indices = try std.ArrayList(ValidatorIndex).initCapacity(allocator, validator_count);
+        errdefer self.next_epoch_shuffling_active_validator_indices.deinit(allocator);
+        self.is_compounding_validator_arr = .empty;
+        self.previous_epoch_participation = .empty;
+        self.current_epoch_participation = .empty;
+        self.rewards = try U64Array.initCapacity(allocator, validator_count);
+        errdefer self.rewards.deinit(allocator);
+        self.penalties = try U64Array.initCapacity(allocator, validator_count);
+        errdefer self.penalties.deinit(allocator);
+        self.slashing_penalties = .empty;
+    }
+
+    pub fn resize(self: *ReusedEpochTransitionCache, validator_count: usize) !void {
+        try self.is_active_prev_epoch.resize(self.allocator, validator_count);
+        try self.is_active_current_epoch.resize(self.allocator, validator_count);
+        try self.is_active_next_epoch.resize(self.allocator, validator_count);
+        try self.flags.resize(self.allocator, validator_count);
+        try self.next_epoch_shuffling_active_validator_indices.resize(self.allocator, validator_count);
+        try self.rewards.resize(self.allocator, validator_count);
+        try self.penalties.resize(self.allocator, validator_count);
+
+        @memset(self.is_active_prev_epoch.items, true);
+        @memset(self.is_active_current_epoch.items, true);
+        @memset(self.is_active_next_epoch.items, true);
     }
 
     pub fn deinit(self: *ReusedEpochTransitionCache) void {
-        self.is_active_prev_epoch.deinit();
-        self.is_active_current_epoch.deinit();
-        self.is_active_next_epoch.deinit();
-        self.proposer_indices.deinit();
-        self.inclusion_delays.deinit();
-        self.flags.deinit();
-        self.next_epoch_shuffling_active_validator_indices.deinit();
-        self.is_compounding_validator_arr.deinit();
-        self.previous_epoch_participation.deinit();
-        self.current_epoch_participation.deinit();
-        self.rewards.deinit();
-        self.penalties.deinit();
+        self.is_active_prev_epoch.deinit(self.allocator);
+        self.is_active_current_epoch.deinit(self.allocator);
+        self.is_active_next_epoch.deinit(self.allocator);
+        self.proposer_indices.deinit(self.allocator);
+        self.inclusion_delays.deinit(self.allocator);
+        self.flags.deinit(self.allocator);
+        self.next_epoch_shuffling_active_validator_indices.deinit(self.allocator);
+        self.is_compounding_validator_arr.deinit(self.allocator);
+        self.previous_epoch_participation.deinit(self.allocator);
+        self.current_epoch_participation.deinit(self.allocator);
+        self.rewards.deinit(self.allocator);
+        self.penalties.deinit(self.allocator);
+        self.slashing_penalties.deinit(self.allocator);
+        self.* = undefined;
     }
 };
 
-pub const EpochTransitionCacheOpts = struct {
-    /// Assert progressive balances the same in the cache.
-    assert_correct_progressive_balances: bool = false,
-    ///  Do not queue shuffling calculation async. Forces sync JIT calculation in afterProcessEpoch
-    async_shuffling_calculation: bool = false,
-};
+threadlocal var _reused_cache: ?*ReusedEpochTransitionCache = null;
 
+fn getReusedEpochTransitionCache(allocator: Allocator, validator_count: usize) !*ReusedEpochTransitionCache {
+    if (_reused_cache) |cache| {
+        try cache.resize(validator_count);
+        return cache;
+    }
+    _reused_cache = try allocator.create(ReusedEpochTransitionCache);
+    errdefer {
+        allocator.destroy(_reused_cache.?);
+        _reused_cache = null;
+    }
+    try _reused_cache.?.init(allocator, validator_count);
+    try _reused_cache.?.resize(validator_count);
+    return _reused_cache.?;
+}
+
+/// Callers must exclude cache initialization and use until teardown returns.
+pub fn deinitReusedEpochTransitionCache() void {
+    if (_reused_cache) |cache| {
+        const allocator = cache.allocator;
+        cache.deinit();
+        allocator.destroy(cache);
+        _reused_cache = null;
+    }
+}
+
+/// Borrows thread-local buffers. Callers must serialize cache lifetimes within each thread from
+/// `init` through `deinit` and exclude `deinitReusedEpochTransitionCache` throughout.
 pub const EpochTransitionCache = struct {
+    /// Allocator used for cache-owned lists.
+    allocator: Allocator,
     prev_epoch: Epoch,
     current_epoch: Epoch,
     total_active_stake_by_increment: u64,
@@ -121,26 +250,36 @@ pub const EpochTransitionCache = struct {
     inclusion_delays: []const usize,
     // this is borrowed from ReusedEpochTransitionCache
     flags: []const u8,
-    // this is borrowed from ReusedEpochTransitionCache, we append it in processPendingDeposits()
-    is_compounding_validator_arr: BoolArray,
+    compounding_validator_flags: CompoundingValidatorFlags,
     rewards: []u64,
     penalties: []u64,
+    slashing_penalties: []u64,
     balances: ?U64Array,
     next_shuffling_active_indices: []const ValidatorIndex,
-    // TODO: nextShufflingDecisionRoot may not needed as we don't use ShufflingCache
+    next_shuffling: ?*EpochShufflingRc,
+    shuffling_job: ?ShufflingJob,
     next_epoch_total_active_balance_by_increment: u64,
-    // TODO: asyncShufflingCalculation may not needed as we don't use ShufflingCache
     // these are borrowed from ReusedEpochTransitionCache
     is_active_prev_epoch: []const bool,
     is_active_curr_epoch: []const bool,
     is_active_next_epoch: []const bool,
 
-    // TODO: no need EpochTransitionCacheOpts for zig version
-    pub fn beforeProcessEpoch(allocator: Allocator, cached_state: *CachedBeaconStateAllForks, reused_cache: *ReusedEpochTransitionCache, out: *EpochTransitionCache) !void {
-        const config = cached_state.config;
-        var epoch_cache = cached_state.getEpochCache();
-        const state = cached_state.state;
-        const fork_seq = config.forkSeq(state.slot());
+    pub fn appendCompoundingValidatorFlag(self: *EpochTransitionCache, value: bool) void {
+        self.compounding_validator_flags.append(value);
+    }
+
+    pub fn isCompoundingValidator(self: *const EpochTransitionCache, validator_index: usize) bool {
+        return self.compounding_validator_flags.get(validator_index);
+    }
+
+    // this is the same to beforeProcessEpoch in typesript version
+    pub fn init(
+        allocator: Allocator,
+        config: *const BeaconConfig,
+        epoch_cache: *EpochCache,
+        state: *AnyBeaconState,
+    ) !EpochTransitionCache {
+        const fork_seq = state.forkSeq();
         const current_epoch = epoch_cache.epoch;
         const prev_epoch = epoch_cache.getPreviousShuffling().epoch;
         const next_epoch = current_epoch + 1;
@@ -149,58 +288,43 @@ pub const EpochTransitionCache = struct {
 
         const slashings_epoch = current_epoch + @divFloor(preset.EPOCHS_PER_SLASHINGS_VECTOR, 2);
 
-        var indices_to_slash = std.ArrayList(ValidatorIndex).init(allocator);
-        var indices_eligible_for_activation_queue = std.ArrayList(ValidatorIndex).init(allocator);
+        var indices_to_slash: std.ArrayList(ValidatorIndex) = .empty;
+        errdefer indices_to_slash.deinit(allocator);
+
+        var indices_eligible_for_activation_queue: std.ArrayList(ValidatorIndex) = .empty;
+        errdefer indices_eligible_for_activation_queue.deinit(allocator);
+
         // we will extract indices_eligible_for_activation from validator_activation_list later
-        var validator_activation_list = ValidatorActivationList.init(allocator);
-        var indices_to_eject = std.ArrayList(ValidatorIndex).init(allocator);
+        var validator_activation_list: ValidatorActivationList = .empty;
+        defer validator_activation_list.deinit(allocator);
+
+        var indices_to_eject: std.ArrayList(ValidatorIndex) = .empty;
+        errdefer indices_to_eject.deinit(allocator);
 
         var total_active_stake_by_increment: u64 = 0;
-        const validator_count = state.validators().items.len;
-        try reused_cache.next_epoch_shuffling_active_validator_indices.resize(validator_count);
-        var next_epoch_shuffling_active_indices_length: usize = 0;
-        // pre-fill with true (most validators are active)
-        try reused_cache.is_active_prev_epoch.resize(validator_count);
-        try reused_cache.is_active_current_epoch.resize(validator_count);
-        try reused_cache.is_active_next_epoch.resize(validator_count);
-        @memset(reused_cache.is_active_prev_epoch.items, true);
-        @memset(reused_cache.is_active_current_epoch.items, true);
-        @memset(reused_cache.is_active_next_epoch.items, true);
-
-        // this will be populated in processRewardsAndPenalties()
-        try reused_cache.rewards.resize(validator_count);
-        try reused_cache.penalties.resize(validator_count);
-
-        // During the epoch transition, additional data is precomputed to avoid traversing any state a second
-        // time. Attestations are a big part of this, and each validator has a "status" to represent its
-        // precomputed participation.
-        // - proposerIndex: number; // -1 when not included by any proposer, for phase0 only so it's declared inside phase0 block below
-        // - inclusionDelay: number;// for phase0 only so it's declared inside phase0 block below
-        // - flags: number; // bitfield of AttesterFlags
-        try reused_cache.flags.resize(validator_count);
-        // flags.fill(0);
-        // flags will be zero'd out below
-        // In the first loop, set slashed+eligibility
-        // In the second loop, set participation flags
-        // TODO: optimize by combining the two loops
-        // likely will require splitting into phase0 and post-phase0 versions
-
-        if (fork_seq.isPostElectra()) {
-            try reused_cache.is_compounding_validator_arr.resize(validator_count);
-        }
+        var validators_view = try state.validators();
+        try validators_view.commit();
+        const validator_count = try validators_view.length();
+        var validators_it = validators_view.iteratorReadonly(0);
 
         // Clone before being mutated in processEffectiveBalanceUpdates
         try epoch_cache.beforeEpochTransition();
 
         const effective_balances_by_increments = epoch_cache.getEffectiveBalanceIncrements().items;
 
+        var next_epoch_shuffling_active_indices_length: usize = 0;
+
+        var reused_cache = try getReusedEpochTransitionCache(allocator, validator_count);
+        if (fork_seq.gte(.electra)) {
+            try reused_cache.is_compounding_validator_arr.resize(reused_cache.allocator, validator_count);
+        }
         for (0..validator_count) |i| {
-            const validator = state.validators().items[i];
+            const validator = try validators_it.nextValuePtr();
             var flag: u8 = 0;
 
             if (validator.slashed) {
                 if (slashings_epoch == validator.withdrawable_epoch) {
-                    try indices_to_slash.append(i);
+                    try indices_to_slash.append(allocator, i);
                 }
             } else {
                 flag |= FLAG_UNSLASHED;
@@ -226,8 +350,8 @@ pub const EpochTransitionCache = struct {
 
             reused_cache.flags.items[i] = flag;
 
-            if (fork_seq.isPostElectra()) {
-                reused_cache.is_compounding_validator_arr.items[i] = hasCompoundingWithdrawalCredential(validator.withdrawal_credentials);
+            if (fork_seq.gte(.electra)) {
+                reused_cache.is_compounding_validator_arr.items[i] = hasCompoundingWithdrawalCredential(&validator.withdrawal_credentials);
             }
 
             if (is_active_curr) {
@@ -245,7 +369,7 @@ pub const EpochTransitionCache = struct {
             //   )
             // ```
             if (validator.activation_eligibility_epoch == FAR_FUTURE_EPOCH and validator.effective_balance >= MIN_ACTIVATION_BALANCE) {
-                try indices_eligible_for_activation_queue.append(i);
+                try indices_eligible_for_activation_queue.append(allocator, i);
             }
 
             // To optimize process_registry_updates():
@@ -262,7 +386,7 @@ pub const EpochTransitionCache = struct {
             //
             // Use `else` since indicesEligibleForActivationQueue + indicesEligibleForActivation are mutually exclusive
             else if (validator.activation_epoch == FAR_FUTURE_EPOCH and validator.activation_eligibility_epoch <= current_epoch) {
-                try validator_activation_list.append(.{
+                try validator_activation_list.append(allocator, .{
                     .validator_index = i,
                     .activation_eligibility_epoch = validator.activation_eligibility_epoch,
                 });
@@ -276,7 +400,7 @@ pub const EpochTransitionCache = struct {
             //
             // Use `else` since indicesEligibleForActivationQueue + indicesEligibleForActivation + indicesToEject are mutually exclusive
             else if (is_active_curr and validator.exit_epoch == FAR_FUTURE_EPOCH and validator.effective_balance <= config.chain.EJECTION_BALANCE) {
-                try indices_to_eject.append(i);
+                try indices_to_eject.append(allocator, i);
             }
 
             if (!is_active_next) {
@@ -316,43 +440,69 @@ pub const EpochTransitionCache = struct {
         std.mem.sort(ValidatorActivation, validator_activation_list.items, {}, sort_fn);
 
         if (fork_seq == ForkSeq.phase0) {
-            try reused_cache.proposer_indices.resize(validator_count);
+            const fork_state = try state.tryCastToFork(.phase0);
+            try reused_cache.proposer_indices.resize(reused_cache.allocator, validator_count);
             // in typescript we prefill with -1 as unset value, in zig we use  validator_count
             @memset(reused_cache.proposer_indices.items, validator_count);
-            try reused_cache.inclusion_delays.resize(validator_count);
+            try reused_cache.inclusion_delays.resize(reused_cache.allocator, validator_count);
             @memset(reused_cache.inclusion_delays.items, 0);
+
+            var previous_epoch_pending_attestations_view = try state.previousEpochPendingAttestations();
+            const previous_epoch_pending_attestations = try previous_epoch_pending_attestations_view.getAllReadonlyValues(allocator);
+            defer {
+                for (previous_epoch_pending_attestations) |*att| {
+                    types.phase0.PendingAttestation.deinit(allocator, att);
+                }
+                allocator.free(previous_epoch_pending_attestations);
+            }
+            var current_epoch_pending_attestations_view = try state.currentEpochPendingAttestations();
+            const current_epoch_pending_attestations = try current_epoch_pending_attestations_view.getAllReadonlyValues(allocator);
+            defer {
+                for (current_epoch_pending_attestations) |*att| {
+                    types.phase0.PendingAttestation.deinit(allocator, att);
+                }
+                allocator.free(current_epoch_pending_attestations);
+            }
+
             try processPendingAttestations(
+                .phase0,
                 allocator,
-                cached_state,
+                epoch_cache,
+                fork_state,
                 reused_cache.proposer_indices.items,
                 validator_count,
                 reused_cache.inclusion_delays.items,
                 reused_cache.flags.items,
-                state.previousEpochPendingAttestations().items,
+                previous_epoch_pending_attestations,
                 prev_epoch,
                 FLAG_PREV_SOURCE_ATTESTER,
                 FLAG_PREV_TARGET_ATTESTER,
                 FLAG_PREV_HEAD_ATTESTER,
             );
             try processPendingAttestations(
+                .phase0,
                 allocator,
-                cached_state,
+                epoch_cache,
+                fork_state,
                 reused_cache.proposer_indices.items,
                 validator_count,
                 reused_cache.inclusion_delays.items,
                 reused_cache.flags.items,
-                state.currentEpochPendingAttestations().items,
+                current_epoch_pending_attestations,
                 current_epoch,
                 FLAG_CURR_SOURCE_ATTESTER,
                 FLAG_CURR_TARGET_ATTESTER,
                 FLAG_CURR_HEAD_ATTESTER,
             );
         } else {
-            try reused_cache.previous_epoch_participation.resize(validator_count);
-            try reused_cache.current_epoch_participation.resize(validator_count);
-            // TODO: does not work for TreeView
-            @memcpy(reused_cache.previous_epoch_participation.items[0..validator_count], state.previousEpochParticipations().items);
-            @memcpy(reused_cache.current_epoch_participation.items[0..validator_count], state.currentEpochParticipations().items);
+            try reused_cache.previous_epoch_participation.resize(reused_cache.allocator, validator_count);
+            try reused_cache.current_epoch_participation.resize(reused_cache.allocator, validator_count);
+
+            var previous_epoch_participation_view = try state.previousEpochParticipation();
+            _ = try previous_epoch_participation_view.getAllInto(reused_cache.previous_epoch_participation.items);
+            var current_epoch_participation_view = try state.currentEpochParticipation();
+            _ = try current_epoch_participation_view.getAllInto(reused_cache.current_epoch_participation.items);
+
             for (0..validator_count) |i| {
                 reused_cache.flags.items[i] |=
                     // checking active status first is required to pass random spec tests in altair
@@ -392,13 +542,14 @@ pub const EpochTransitionCache = struct {
             }
         }
 
-        // assertCorrectProgressiveBalances = true by default
-        if (fork_seq.isPostAltair()) {
+        if (fork_seq.gte(.altair)) {
             if (epoch_cache.current_target_unslashed_balance_increments != curr_target_unsl_stake) {
-                return error.InCorrectCurrentTargetUnslashedBalance;
+                try metrics.state_transition.progressive_balances_mismatches.incr(.{ .target = .current });
+                epoch_cache.current_target_unslashed_balance_increments = curr_target_unsl_stake;
             }
             if (epoch_cache.previous_target_unslashed_balance_increments != prev_target_unsl_stake) {
-                return error.InCorrectPreviousTargetUnslashedBalance;
+                try metrics.state_transition.progressive_balances_mismatches.incr(.{ .target = .previous });
+                epoch_cache.previous_target_unslashed_balance_increments = prev_target_unsl_stake;
             }
         }
 
@@ -420,11 +571,16 @@ pub const EpochTransitionCache = struct {
 
         // zig specific map function similar to "indicesEligibleForActivation.map(({validatorIndex}) => validatorIndex)"
         var indices_eligible_for_activation = try std.ArrayList(ValidatorIndex).initCapacity(allocator, validator_activation_list.items.len);
+        errdefer indices_eligible_for_activation.deinit(allocator);
         for (validator_activation_list.items) |activation| {
-            try indices_eligible_for_activation.append(activation.validator_index);
+            try indices_eligible_for_activation.append(allocator, activation.validator_index);
         }
 
-        out.* = .{
+        // Resizing to zero clears the previous epoch's length while retaining capacity.
+        try reused_cache.slashing_penalties.resize(reused_cache.allocator, indices_to_slash.items.len);
+
+        return .{
+            .allocator = allocator,
             .prev_epoch = prev_epoch,
             .current_epoch = current_epoch,
             .total_active_stake_by_increment = total_active_stake_by_increment,
@@ -438,6 +594,8 @@ pub const EpochTransitionCache = struct {
             .indices_eligible_for_activation = indices_eligible_for_activation,
             .indices_to_eject = indices_to_eject,
             .next_shuffling_active_indices = next_shuffling_active_indices,
+            .next_shuffling = null,
+            .shuffling_job = null,
             // to be updated in processEffectiveBalanceUpdates
             .next_epoch_total_active_balance_by_increment = 0,
             .is_active_prev_epoch = reused_cache.is_active_prev_epoch.items,
@@ -446,29 +604,48 @@ pub const EpochTransitionCache = struct {
             .proposer_indices = reused_cache.proposer_indices.items,
             .inclusion_delays = reused_cache.inclusion_delays.items,
             .flags = reused_cache.flags.items,
-            .is_compounding_validator_arr = reused_cache.is_compounding_validator_arr,
+            .compounding_validator_flags = .{ .base = reused_cache.is_compounding_validator_arr.items },
             .rewards = reused_cache.rewards.items,
             .penalties = reused_cache.penalties.items,
+            .slashing_penalties = reused_cache.slashing_penalties.items,
             // Will be assigned in processRewardsAndPenalties()
             .balances = null,
         };
     }
 
+    pub fn startShuffling(self: *EpochTransitionCache, allocator: Allocator, io: std.Io, seed: [32]u8, epoch: Epoch) !void {
+        std.debug.assert(self.shuffling_job == null);
+        const active_indices = try allocator.alloc(ValidatorIndex, self.next_shuffling_active_indices.len);
+        std.mem.copyForwards(ValidatorIndex, active_indices, self.next_shuffling_active_indices);
+        self.shuffling_job = ShufflingJob.start(allocator, io, seed, epoch, active_indices);
+    }
+
+    pub fn joinShuffling(self: *EpochTransitionCache) !*EpochShuffling {
+        var job = self.shuffling_job orelse return error.ShufflingJobNotStarted;
+        self.shuffling_job = null;
+        return job.join();
+    }
+
     pub fn deinit(self: *EpochTransitionCache) void {
+        if (self.next_shuffling) |next_shuffling| next_shuffling.unref();
+        if (self.shuffling_job) |*job| job.cancel();
         // no need to deinit proposer_indices and inclusion_delays as they are from reused_cache
         // no need to deinit below as they are from reused_cache
         // self.flags.deinit();
         // self.is_active_prev_epoch.deinit();
         // self.is_active_curr_epoch.deinit();
         // self.is_active_next_epoch.deinit();
-        // self.is_compounding_validator_arr.deinit();
-        self.indices_to_slash.deinit();
-        self.indices_eligible_for_activation_queue.deinit();
-        self.indices_eligible_for_activation.deinit();
-        self.indices_to_eject.deinit();
+        self.indices_to_slash.deinit(self.allocator);
+        self.indices_eligible_for_activation_queue.deinit(self.allocator);
+        self.indices_eligible_for_activation.deinit(self.allocator);
+        self.indices_to_eject.deinit(self.allocator);
         // rewards and penalties are from reused_cache
-        if (self.balances) |balances| {
-            balances.deinit();
+        if (self.balances) |*balances| {
+            balances.deinit(self.allocator);
         }
     }
 };
+
+test {
+    _ = @import("epoch_transition_cache_test.zig");
+}

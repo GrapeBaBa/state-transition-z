@@ -6,7 +6,7 @@ pub const Preset = enum(u8) {
     gnosis = 2,
 
     pub fn name(self: Preset) []const u8 {
-        @tagName(self);
+        return @tagName(self);
     }
 };
 
@@ -82,8 +82,12 @@ const PresetMainnet = struct {
     pub const MAX_PENDING_PARTIALS_PER_WITHDRAWALS_SWEEP = 8;
     pub const DEPOSIT_CONTRACT_TREE_DEPTH = 32;
     pub const GENESIS_SLOT = 0;
-    pub const FAR_FUTURE_EPOCH = 18_446_744_073_709_551_615; // 2*64 -1;
     pub const MAX_PENDING_DEPOSITS_PER_EPOCH = 16;
+    pub const PTC_SIZE = 512;
+    pub const MAX_PAYLOAD_ATTESTATIONS = 4;
+    pub const BUILDER_REGISTRY_LIMIT = 1_099_511_627_776;
+    pub const BUILDER_PENDING_WITHDRAWALS_LIMIT = 1_048_576;
+    pub const MAX_BUILDERS_PER_WITHDRAWALS_SWEEP = 16384;
 };
 
 const PresetMinimal = struct {
@@ -137,9 +141,9 @@ const PresetMinimal = struct {
     pub const MAX_WITHDRAWALS_PER_PAYLOAD = 4;
     pub const MAX_VALIDATORS_PER_WITHDRAWALS_SWEEP = 16;
     pub const FIELD_ELEMENTS_PER_BLOB = 4096;
-    pub const MAX_BLOB_COMMITMENTS_PER_BLOCK = 32;
+    pub const MAX_BLOB_COMMITMENTS_PER_BLOCK = 4096;
     pub const MAX_BLOBS_PER_BLOCK = 6;
-    pub const KZG_COMMITMENT_INCLUSION_PROOF_DEPTH = 10;
+    pub const KZG_COMMITMENT_INCLUSION_PROOF_DEPTH = 17;
     pub const MIN_ACTIVATION_BALANCE = 32000000000;
     pub const MAX_EFFECTIVE_BALANCE_ELECTRA = 2048000000000;
     pub const PENDING_DEPOSITS_LIMIT = 134217728;
@@ -151,11 +155,17 @@ const PresetMinimal = struct {
     pub const MAX_WITHDRAWAL_REQUESTS_PER_PAYLOAD = 16;
     pub const MAX_CONSOLIDATION_REQUESTS_PER_PAYLOAD = 2;
     pub const WHISTLEBLOWER_REWARD_QUOTIENT_ELECTRA = 4096;
+    pub const MIN_SLASHING_PENALTY_QUOTIENT_ELECTRA = 4096;
     pub const FIELD_ELEMENTS_PER_CELL = 64;
     pub const FIELD_ELEMENTS_PER_EXT_BLOB = 8192;
     pub const KZG_COMMITMENTS_INCLUSION_PROOF_DEPTH = 4;
     pub const MAX_PENDING_PARTIALS_PER_WITHDRAWALS_SWEEP = 2;
     pub const MAX_PENDING_DEPOSITS_PER_EPOCH = PresetMainnet.MAX_PENDING_DEPOSITS_PER_EPOCH;
+    pub const PTC_SIZE = 2;
+    pub const MAX_PAYLOAD_ATTESTATIONS = 4;
+    pub const BUILDER_REGISTRY_LIMIT = 1_099_511_627_776;
+    pub const BUILDER_PENDING_WITHDRAWALS_LIMIT = 1_048_576;
+    pub const MAX_BUILDERS_PER_WITHDRAWALS_SWEEP = 16;
 };
 
 const preset_str = @import("build_options").preset;

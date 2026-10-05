@@ -1,19 +1,23 @@
 const std = @import("std");
+const metrics = @import("../metrics.zig");
 const Allocator = std.mem.Allocator;
-const CachedBeaconStateAllForks = @import("../cache/state_cache.zig").CachedBeaconStateAllForks;
-const BeaconStateAllForks = @import("../types/beacon_state.zig").BeaconStateAllForks;
-const ssz = @import("consensus_types");
-const Epoch = ssz.primitive.Epoch.Type;
+const types = @import("consensus_types");
+const Epoch = types.primitive.Epoch.Type;
 const preset = @import("preset").preset;
+const BeaconConfig = @import("config").BeaconConfig;
 const ForkSeq = @import("config").ForkSeq;
+const EpochCache = @import("../cache/epoch_cache.zig").EpochCache;
+const ProposerRewards = @import("../cache/state_cache.zig").ProposerRewards;
+const ForkTypes = @import("fork_types").ForkTypes;
+const BeaconState = @import("fork_types").BeaconState;
+const SlashingsCache = @import("../cache/slashings_cache.zig").SlashingsCache;
 const c = @import("constants");
-const RootCache = @import("../utils/root_cache.zig").RootCache;
+const RootCache = @import("../cache/root_cache.zig").RootCache;
 const validateAttestation = @import("./process_attestation_phase0.zig").validateAttestation;
 const getAttestationWithIndicesSignatureSet = @import("../signature_sets/indexed_attestation.zig").getAttestationWithIndicesSignatureSet;
 const verifyAggregatedSignatureSet = @import("../utils/signature_sets.zig").verifyAggregatedSignatureSet;
-const Phase0Attestation = ssz.phase0.Attestation.Type;
-const ElectraAttestation = ssz.electra.Attestation.Type;
-const Checkpoint = ssz.phase0.Checkpoint.Type;
+const getBeaconProposer = @import("../cache/get_beacon_proposer.zig").getBeaconProposer;
+const Checkpoint = types.phase0.Checkpoint.Type;
 const isTimelyTarget = @import("./process_attestation_phase0.zig").isTimelyTarget;
 const increaseBalance = @import("../utils/balance.zig").increaseBalance;
 
@@ -26,62 +30,83 @@ const TIMELY_HEAD = 1 << c.TIMELY_HEAD_FLAG_INDEX;
 const SLOTS_PER_EPOCH_SQRT = std.math.sqrt(preset.SLOTS_PER_EPOCH);
 
 /// AT = AttestationType
-/// for phase0 it's `ssz.phase0.Attestation.Type`
-/// for electra it's `ssz.electra.Attestation.Type`
-pub fn processAttestationsAltair(allocator: Allocator, cached_state: *const CachedBeaconStateAllForks, comptime AT: type, attestations: []AT, verify_signature: bool) !void {
-    const state = cached_state.state;
-    const epoch_cache = cached_state.getEpochCache();
-    const effective_balance_increments = epoch_cache.effective_balance_increment.get().items;
-    const state_slot = state.slot();
+/// for phase0 it's `types.phase0.Attestation.Type`
+/// for electra it's `types.electra.Attestation.Type`
+pub fn processAttestationsAltair(
+    comptime fork: ForkSeq,
+    allocator: Allocator,
+    io: std.Io,
+    config: *const BeaconConfig,
+    epoch_cache: *EpochCache,
+    state: *BeaconState(fork),
+    proposer_rewards: *ProposerRewards,
+    slashings_cache: *const SlashingsCache,
+    attestations: []const ForkTypes(fork).Attestation.Type,
+    verify_signature: bool,
+) !void {
+    const effective_balance_increments = epoch_cache.effective_balance_increments.get().items;
+    const state_slot = try state.slot();
     const current_epoch = epoch_cache.epoch;
 
-    const root_cache = try RootCache.init(allocator, cached_state);
+    const root_cache = try RootCache(fork).init(allocator, state);
     // TODO: should use arena allocator per block processing?
     defer root_cache.deinit();
 
     // Process all attestations first and then increase the balance of the proposer once
-    // let newSeenAttesters = 0;
-    // let newSeenAttestersEffectiveBalance = 0;
+    var new_seen_attesters: u64 = 0;
+    var new_seen_attesters_effective_balance: u64 = 0;
 
     var proposer_reward: u64 = 0;
-    for (attestations) |attestation| {
-        const data = attestation.data;
-        try validateAttestation(AT, cached_state, attestation);
+    for (attestations) |*attestation| {
+        const data = &attestation.data;
+        try validateAttestation(fork, epoch_cache, state, attestation);
 
         // Retrieve the validator indices from the attestation participation bitfield
-        const attesting_indices = try if (AT == Phase0Attestation) epoch_cache.getAttestingIndicesPhase0(&attestation) else epoch_cache.getAttestingIndicesElectra(&attestation);
-        defer attesting_indices.deinit();
+        var attesting_indices = try if (comptime fork.lt(.electra)) epoch_cache.getAttestingIndicesPhase0(allocator, attestation) else epoch_cache.getAttestingIndicesElectra(allocator, attestation);
+        defer attesting_indices.deinit(allocator);
 
         // this check is done last because its the most expensive (if signature verification is toggled on)
-        // TODO: Why should we verify an indexed attestation that we just created? If it's just for the signature
-        // we can verify only that and nothing else.
+        // Unlike phase0 which calls isValidIndexedAttestation, altair+ only verifies the signature
+        // since the other checks (sorting, bounds) are already done in validateAttestation above.
         if (verify_signature) {
-            const sig_set = try getAttestationWithIndicesSignatureSet(allocator, cached_state, &attestation.data, attestation.signature, attesting_indices.items);
+            const sig_set = try getAttestationWithIndicesSignatureSet(
+                allocator,
+                io,
+                config,
+                epoch_cache,
+                &attestation.data,
+                attestation.signature,
+                attesting_indices.items,
+            );
+            defer allocator.free(sig_set.pubkeys);
             if (!try verifyAggregatedSignatureSet(&sig_set)) {
                 return error.InvalidSignature;
             }
         }
 
         const in_current_epoch = data.target.epoch == current_epoch;
-        var epoch_participation = if (in_current_epoch) state.currentEpochParticipations().items else state.previousEpochParticipations().items;
-        const flags_attestation = try getAttestationParticipationStatus(state, data, state_slot - data.slot, current_epoch, root_cache);
+        var epoch_participation = if (in_current_epoch) try state.currentEpochParticipation() else try state.previousEpochParticipation();
+        const flags_attestation = try getAttestationParticipationStatus(fork, data, state_slot - data.slot, current_epoch, root_cache);
 
         // For each participant, update their participation
         // In epoch processing, this participation info is used to calculate balance updates
         var total_balance_increments_with_weight: u64 = 0;
-        const validators = state.validators().items;
         for (attesting_indices.items) |validator_index| {
-            const flags = epoch_participation[validator_index];
+            const flags = try epoch_participation.get(validator_index);
 
             // For normal block, > 90% of attestations belong to current epoch
             // At epoch boundary, 100% of attestations belong to previous epoch
             // so we want to update the participation flag tree in batch
 
-            // Note ParticipationFlags type uses option {setBitwiseOR: true}, .set() does a |= operation
-            epoch_participation[validator_index] = flags_attestation;
+            // no setBitwiseOR implemented in zig ssz, so we do it manually here
+            try epoch_participation.set(validator_index, flags_attestation | flags);
 
             // Returns flags that are NOT set before (~ bitwise NOT) AND are set after
             const flags_new_set = ~flags & flags_attestation;
+            if (flags_new_set != 0) {
+                new_seen_attesters += 1;
+                new_seen_attesters_effective_balance += effective_balance_increments[validator_index];
+            }
 
             // Spec:
             // baseReward = state.validators[index].effectiveBalance / EFFECTIVE_BALANCE_INCREMENT * baseRewardPerIncrement;
@@ -98,8 +123,7 @@ pub fn processAttestationsAltair(allocator: Allocator, cached_state: *const Cach
             // TODO: describe issue. Compute progressive target balances
             // When processing each attestation, increase the cummulative target balance. Only applies post-altair
             if ((flags_new_set & TIMELY_TARGET) == TIMELY_TARGET) {
-                const validator = validators[validator_index];
-                if (!validator.slashed) {
+                if (!slashings_cache.isSlashed(validator_index)) {
                     if (in_current_epoch) {
                         epoch_cache.current_target_unslashed_balance_increments += effective_balance_increments[validator_index];
                     } else {
@@ -107,38 +131,48 @@ pub fn processAttestationsAltair(allocator: Allocator, cached_state: *const Cach
                     }
                 }
             }
-
-            // Do the discrete math inside the loop to ensure a deterministic result
-            const total_increments = total_balance_increments_with_weight;
-            const proposer_reward_numerator = total_increments * epoch_cache.base_reward_per_increment;
-            proposer_reward += @divFloor(proposer_reward_numerator, PROPOSER_REWARD_DOMINATOR);
         }
-
-        increaseBalance(state, try epoch_cache.getBeaconProposer(state_slot), proposer_reward);
+        // Do the discrete math inside the loop to ensure a deterministic result
+        const total_increments = total_balance_increments_with_weight;
+        const proposer_reward_numerator = total_increments * epoch_cache.base_reward_per_increment;
+        proposer_reward += @divFloor(proposer_reward_numerator, PROPOSER_REWARD_DOMINATOR);
     }
+
+    metrics.state_transition.new_seen_attesters_per_block.set(new_seen_attesters);
+    metrics.state_transition.new_seen_attesters_effective_balance_per_block.set(new_seen_attesters_effective_balance);
+    metrics.state_transition.attestations_per_block.set(@intCast(attestations.len));
+
+    try increaseBalance(fork, state, try getBeaconProposer(fork, epoch_cache, state, state_slot), proposer_reward);
+    proposer_rewards.attestations = proposer_reward;
 }
 
-pub fn getAttestationParticipationStatus(state: *const BeaconStateAllForks, data: ssz.phase0.AttestationData.Type, inclusion_delay: u64, current_epoch: Epoch, root_cache: *RootCache) !u8 {
-    const justified_checkpoint: Checkpoint = if (data.target.epoch == current_epoch)
-        root_cache.current_justified_checkpoint
+pub fn getAttestationParticipationStatus(
+    comptime fork: ForkSeq,
+    data: *const types.phase0.AttestationData.Type,
+    inclusion_delay: u64,
+    current_epoch: Epoch,
+    root_cache: *RootCache(fork),
+) !u8 {
+    const justified_checkpoint = if (data.target.epoch == current_epoch)
+        &root_cache.current_justified_checkpoint
     else
-        root_cache.previous_justified_checkpoint;
-    const is_matching_source = checkpointValueEquals(data.source, justified_checkpoint);
+        &root_cache.previous_justified_checkpoint;
+    const is_matching_source = checkpointValueEquals(&data.source, justified_checkpoint);
     if (!is_matching_source) return error.InvalidAttestationSource;
 
-    const is_matching_target = std.mem.eql(u8, &data.target.root, &try root_cache.getBlockRoot(data.target.epoch));
+    const is_matching_target = std.mem.eql(u8, &data.target.root, try root_cache.getBlockRoot(data.target.epoch));
 
     // a timely head is only be set if the target is _also_ matching
     const is_matching_head =
-        is_matching_target and std.mem.eql(u8, &data.beacon_block_root, &try root_cache.getBlockRootAtSlot(data.slot));
+        is_matching_target and std.mem.eql(u8, &data.beacon_block_root, try root_cache.getBlockRootAtSlot(data.slot));
 
     var flags: u8 = 0;
     if (is_matching_source and inclusion_delay <= SLOTS_PER_EPOCH_SQRT) flags |= TIMELY_SOURCE;
-    if (is_matching_target and isTimelyTarget(state, inclusion_delay)) flags |= TIMELY_TARGET;
+    if (is_matching_target and isTimelyTarget(fork, inclusion_delay)) flags |= TIMELY_TARGET;
     if (is_matching_head and inclusion_delay == preset.MIN_ATTESTATION_INCLUSION_DELAY) flags |= TIMELY_HEAD;
     return flags;
 }
 
-pub fn checkpointValueEquals(cp1: Checkpoint, cp2: Checkpoint) bool {
+pub fn checkpointValueEquals(cp1: *const Checkpoint, cp2: *const Checkpoint) bool {
     return cp1.epoch == cp2.epoch and std.mem.eql(u8, &cp1.root, &cp2.root);
 }
